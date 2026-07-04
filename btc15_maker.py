@@ -116,9 +116,16 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s",
                     datefmt="%H:%M:%S")
 log = logging.getLogger("btc15")
+logging.getLogger("websocket").setLevel(logging.CRITICAL)  # hide library noise
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "btc15-maker/1.0"})
 ND = NormalDist()
+
+TZ_OFFSET_H = float(_env("TZ_OFFSET_H", "8"))  # show times in PH time by default
+
+def fmt_hm(epoch):
+    """Format an epoch as HH:MM in the user's local time (display only)."""
+    return time.strftime("%H:%M", time.gmtime(epoch + TZ_OFFSET_H * 3600))
 
 # ---------------------------------------------------------------------------
 # Math (pure — covered by --selftest)
@@ -295,7 +302,7 @@ class PriceFeed:
 
         def on_open(ws):
             ws.send(sub)
-            log.info("rtds subscribed (chainlink + binance topics)")
+            log.info("📡 Live Bitcoin price stream connected")
 
             def pinger():           # RTDS requires app-level PING every ~5s
                 while getattr(ws, "keep_running", True):
@@ -309,9 +316,10 @@ class PriceFeed:
         def on_message(_ws, msg):
             if msg == "PONG":
                 return
-            if self._raw_seen < 3:
+            if self._raw_seen < 1:
                 self._raw_seen += 1
-                log.info("rtds sample frame: %.200s", msg)
+                log.info("🔍 First data sample (technical, safe to ignore): "
+                         "%.160s", msg)
             for ts, price in parse_rtds(msg):
                 self.on_price(ts, price)
                 self.ws_ts = time.time()
@@ -325,7 +333,8 @@ class PriceFeed:
                 ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:  # noqa: BLE001
                 log.warning("ws error: %s", e)
-            log.info("ws reconnecting in 3s (REST backup active meanwhile)...")
+            log.info("🔄 Price stream dropped — reconnecting in 3s (backup feed "
+                     "already covering, nothing lost)")
             time.sleep(3)
 
     def _rest_poll(self):
@@ -448,7 +457,7 @@ class LiveOrders:
         self.c = ClobClient(CLOB, **kw)
         self.c.set_api_creds(self.c.create_or_derive_api_creds())
         self.open = {}   # order_id -> {"token","price","size","matched"}
-        log.info("LIVE order client ready.")
+        log.info("🔗 Connected to your Polymarket account — live orders enabled")
 
     def place(self, token_id, price, size):
         try:
@@ -521,9 +530,11 @@ class Window:
         self.fills += 1
         ledger({"type": "fill", "slug": self.m["slug"], "side": side,
                 "price": price, "qty": qty, "net_inv": self.net()})
-        log.info("FILL %s %s x%.0f @ %.2f | inv up/dn %.0f/%.0f cash %.2f",
-                 self.m["slug"][-10:], side.upper(), qty, price,
-                 self.inv_up, self.inv_dn, self.cash)
+        log.info("📥 %s FILL: bought %.0f %s at %.0f¢ | now holding %.0f UP / "
+                 "%.0f DOWN | spent $%.2f this round",
+                 "PAPER" if DRY_RUN else "LIVE", qty,
+                 "UP" if side == "up" else "DOWN", price * 100,
+                 self.inv_up, self.inv_dn, -self.cash)
 
 # ---------------------------------------------------------------------------
 # Main engine
@@ -566,15 +577,18 @@ class Engine:
             self.pending.append(self.win)
         m = find_window_market(end)
         if not m:
-            log.warning("market not found for window ending %s", end)
+            log.warning("⚠️ Couldn't find this round's market yet — will retry "
+                        "next round (harmless unless it repeats for 30+ min): %s",
+                        fmt_hm(end))
             self.win = None
             return
         self.win = Window(start, end, m)
         k = self.feed.price_at(start)
         if k:
             self.win.strike, self.win.strike_src = k, "feed"
-        log.info("── new window %s | strike %s", m["slug"],
-                 f"{k:.2f}" if k else "pending")
+        log.info("🕐 NEW ROUND ends %s | UP wins if Bitcoin finishes at or above %s",
+                 fmt_hm(end),
+                 f"${k:,.2f}" if k else "(catching the start price...)")
 
     def ensure_strike(self, S, books, tau):
         w = self.win
@@ -590,7 +604,8 @@ class Engine:
             k = implied_strike(S, mid, self.feed.sigma_sec(), tau)
             if k:
                 w.strike, w.strike_src = k, "implied"
-                log.info("strike implied from mid=%.2f -> K=%.2f", mid, k)
+                log.info("ℹ️ Joined mid-round — estimated the start price at %s "
+                         "from the market's odds", f"${k:,.2f}")
                 return True
         return False
 
@@ -610,9 +625,9 @@ class Engine:
             if res is None:
                 if time.time() > w.end + 600:      # give up loudly, not silently
                     self.pending.remove(w)
-                    log.warning("window %s UNRESOLVED after 10min — dropped "
-                                "(no gamma result, no feed tick at end)",
-                                w.m["slug"][-10:])
+                    log.warning("⚠️ Round ending %s could not be scored "
+                                "(no result data) — skipped. Rare is fine; "
+                                "frequent means tell Claude.", fmt_hm(w.end))
                     ledger({"type": "window_unresolved", "slug": w.m["slug"]})
                 continue
             payout = w.inv_up if res == "up" else w.inv_dn
@@ -636,15 +651,22 @@ class Engine:
                 ledger({"type": "audit", "slug": w.m["slug"], **a,
                         "result": res, "win": win, "pnl": round(apnl, 4)})
             sh = max(self.tot["shares"], 1)
-            log.info("SETTLE %s %s | window pnl %+.2f || totals: %d wins? n/a, "
-                     "%d windows, %.0f sh, pnl %+.2f (%.2fc/sh) | audit %d/%d ev %+.3f",
-                     w.m["slug"][-10:], res.upper(), pnl, self.tot["windows"],
-                     self.tot["shares"], self.tot["pnl"],
-                     100 * self.tot["pnl"] / sh,
-                     self.tot["audit_wins"], self.tot["audit_n"],
-                     self.tot["audit_pnl"] / max(self.tot["audit_n"], 1))
-            log.info("bankroll $%.2f | next quote size %.0f shares | resolved via %s",
-                     self.bankroll(), self.quote_size(), src)
+            if w.inv_up + w.inv_dn > 0:
+                pnl_txt = (f"we made +${pnl:.2f} 🎉" if pnl > 0 else
+                           (f"we lost -${-pnl:.2f}" if pnl < 0 else
+                            "we broke even ($0.00)"))
+            else:
+                pnl_txt = "no trades this round ($0.00)"
+            log.info("🏁 ROUND RESULT (%s): Bitcoin went %s → %s",
+                     fmt_hm(w.end), res.upper(), pnl_txt)
+            tot_txt = (f"${self.tot['pnl']:+.2f} over {self.tot['windows']} rounds "
+                       f"({100 * self.tot['pnl'] / sh:+.2f}¢/share)")
+            aud_txt = (f"{self.tot['audit_wins']}/{self.tot['audit_n']} wins, "
+                       f"{self.tot['audit_pnl'] / self.tot['audit_n']:+.2f} per $1"
+                       if self.tot["audit_n"] else "no data yet")
+            log.info("💰 Bankroll $%.2f | all-time %s | next bet %.0f shares | "
+                     "momentum-idea test: %s | result via %s",
+                     self.bankroll(), tot_txt, self.quote_size(), aud_txt, src)
             self.pending.remove(w)
 
     # -- quoting ----------------------------------------------------------------
@@ -657,10 +679,10 @@ class Engine:
             self.halted = True
             if self.live:
                 self.live.cancel_all()
-            log.critical("DRAWDOWN BRAKE: bankroll $%.2f fell below %.0f%% of "
-                         "start ($%.2f) — quoting stopped. Review the ledger "
-                         "before restarting.", self.bankroll(),
-                         DRAWDOWN_STOP * 100, BANKROLL_START)
+            log.critical("🛑 SAFETY BRAKE: bankroll $%.2f fell below %.0f%% "
+                         "of your $%.2f start — the bot has STOPPED itself. "
+                         "Run --status and talk to Claude before restarting.",
+                         self.bankroll(), DRAWDOWN_STOP * 100, BANKROLL_START)
             ledger({"type": "drawdown_halt", "bankroll": round(self.bankroll(), 2)})
         if self.halted:
             return
@@ -672,8 +694,9 @@ class Engine:
         if not lt or now - lt[0] > 20:
             if now - getattr(self, "_stale_log", 0) > 30:
                 self._stale_log = now
-                log.warning("price feed stale — not quoting (auto-retrying; "
-                            "run --feedtest to diagnose)")
+                log.warning("⏳ Waiting for a fresh Bitcoin price — paused, will "
+                            "auto-recover (run --feedtest only if this repeats "
+                            "for many minutes)")
             return
         S = lt[1]
         books = fetch_books([w.m["up"], w.m["down"]])
@@ -718,8 +741,13 @@ class Engine:
                     self.live.cancel_all()
                 w.quotes = {"up": None, "dn": None}
                 w.done_quoting = True
-                log.info("last %ds — quotes pulled, inv up/dn %.0f/%.0f",
-                         int(tau), w.inv_up, w.inv_dn)
+                if w.inv_up or w.inv_dn:
+                    log.info("⏸️ Final minutes — offers pulled; riding to the "
+                             "finish holding %.0f UP / %.0f DOWN",
+                             w.inv_up, w.inv_dn)
+                else:
+                    log.info("⏸️ Final minutes — offers pulled (no trades held "
+                             "this round)")
             return
 
         P = fair_prob(S, w.strike, self.feed.sigma_sec(), tau)
@@ -732,8 +760,9 @@ class Engine:
             if gap > MODEL_PAUSE:
                 if now - getattr(self, "_pause_log", 0) > 30:
                     self._pause_log = now
-                    log.warning("model %.2f vs mid %.2f — quoting paused, "
-                                "quotes pulled", P, mid)
+                    log.warning("⚠️ The market's odds (%.2f) and my math (%.2f) "
+                                "disagree a lot — standing aside for safety, "
+                                "offers cancelled", mid, P)
                 if self.live:
                     self.live.cancel_all()
                 w.quotes = {"up": None, "dn": None}
@@ -773,12 +802,17 @@ class Engine:
 
     def run(self):
         self.feed.start()
-        log.info("btc15 maker v2 | %s | bankroll $%.2f | quote size %s | "
-                 "half-spread %.0fc | brake at $%.2f",
-                 "DRY-RUN (paper)" if DRY_RUN else "LIVE", self.bankroll(),
-                 ("%.0f sh, compounding" % self.quote_size()) if COMPOUND
-                 else ("%.0f sh, fixed" % QUOTE_SIZE),
-                 HALF_SPREAD * 100, DRAWDOWN_STOP * BANKROLL_START)
+        log.info("🤖 BTC 15-min bot v2 | %s",
+                 "PRACTICE MODE — fake money, totally safe" if DRY_RUN
+                 else "⚡ LIVE MODE — real money!")
+        log.info("💵 Bankroll $%.2f | bet size %s | 🛑 safety brake if bankroll hits $%.2f",
+                 self.bankroll(),
+                 ("%.0f shares (grows when you win)" % self.quote_size()) if COMPOUND
+                 else ("%.0f shares fixed" % QUOTE_SIZE),
+                 DRAWDOWN_STOP * BANKROLL_START)
+        log.info("📖 How to read these logs: 🕐 new round starts | 📥 a trade "
+                 "happened | 🏁 round result | 💰 your money | ⚠️/⏳ bot standing "
+                 "aside (normal sometimes)")
         stop = {"f": False}
         signal.signal(signal.SIGTERM, lambda *_: stop.update(f=True))
         while not stop["f"]:
@@ -795,7 +829,7 @@ class Engine:
                 break
         if self.live:
             self.live.cancel_all()
-        log.info("session totals: %s", json.dumps(
+        log.info("👋 Bot stopped. This session: %s", json.dumps(
             {k: round(v, 3) if isinstance(v, float) else v
              for k, v in self.tot.items()}))
 
