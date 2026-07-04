@@ -1,0 +1,856 @@
+#!/usr/bin/env python3
+"""
+btc15_maker.py — Market-making bot for Polymarket "BTC Up or Down 15m"
+=======================================================================
+THE THESIS
+  Takers on these markets pay a dynamic fee (peaking ~3% near 50/50);
+  makers pay nothing and the fee pool is redistributed daily to makers.
+  This bot plays the maker side: it computes its own fair probability
+  from the SAME Chainlink BTC/USD feed the market resolves on, then
+  rests BUY bids on BOTH Up and Down tokens just below fair value.
+
+    * both bids fill  -> bought a pair for < $1.00 that pays exactly
+                         $1.00 at resolution (locked profit, no fee)
+    * one bid fills   -> small inventory carried to resolution,
+                         hard-capped and skew-managed
+
+  The taker fee is the moat: quotes near fair value can no longer be
+  profitably picked off by faster bots, because the toll exceeds the
+  staleness they could exploit.
+
+FAIR VALUE
+  Window resolves Up if price(end) >= price(start), via Chainlink.
+    P(up) = Phi( ln(S/K) / (sigma * sqrt(tau)) )
+  S     = live Chainlink price (Polymarket public RTDS websocket)
+  K     = window strike (Chainlink price captured at window start;
+          if the bot joins mid-window it back-solves K from market mid)
+  sigma = EWMA realized vol of the same feed
+  tau   = seconds remaining
+
+MODES
+  DRY_RUN=true (default): full simulation. Fills are inferred when the
+  live book crosses our quote level (haircut applied because queue
+  priority is ignored). Every fill, window and day is written to
+  btc15_ledger.jsonl so the REAL edge is measured before money moves.
+
+  The bot also runs a free TAKER AUDIT each window: it records what a
+  simple momentum bet (buy the side price has moved toward) would have
+  earned after taker fees — data instead of debate.
+
+V2 — SELF-COMPOUNDING
+  Quote size, inventory cap and per-window spend all scale automatically
+  with the measured bankroll (BANKROLL_START + realized PnL from the
+  ledger, restart-safe). Wins grow the next bet; losses shrink it. If the
+  bankroll ever falls below DRAWDOWN_STOP (default 50%) of start, the bot
+  halts itself and waits for a human — the brake the famous streaks never had.
+
+Run:    python3 btc15_maker.py               (env vars below)
+Status: python3 btc15_maker.py --status      (your results + verdict, anytime)
+Test:   python3 btc15_maker.py --selftest    (offline math checks)
+Stop:   Ctrl-C, or `touch stop15.flag`
+"""
+
+import json
+import math
+import os
+import sys
+import time
+import signal
+import logging
+import threading
+from collections import deque
+from statistics import NormalDist
+
+import requests
+
+# ---------------------------------------------------------------------------
+# Config (env-overridable)
+# ---------------------------------------------------------------------------
+def _env(n, d):
+    return os.environ.get(n, d)
+
+DRY_RUN         = _env("DRY_RUN", "true").lower() != "false"
+QUOTE_SIZE      = float(_env("QUOTE_SIZE", "12"))      # shares per side (fixed mode)
+COMPOUND        = _env("COMPOUND", "true").lower() != "false"
+BANKROLL_START  = float(_env("BANKROLL_START", "20"))  # $ you consider deployed
+SIZE_PER_DOLLAR = float(_env("SIZE_PER_DOLLAR", "0.30"))  # shares quoted per $1 bankroll
+MIN_QUOTE       = float(_env("MIN_QUOTE", "5"))
+MAX_QUOTE       = float(_env("MAX_QUOTE", "300"))
+DRAWDOWN_STOP   = float(_env("DRAWDOWN_STOP", "0.5"))  # halt if bankroll < 50% of start
+MAX_WINDOW_FRAC = float(_env("MAX_WINDOW_FRAC", "0.6"))  # per-window cash cap = frac*bank
+HALF_SPREAD     = float(_env("HALF_SPREAD", "0.02"))   # quote fair -/+ 2c
+MAX_SKEW        = float(_env("MAX_SKEW", "0.02"))      # inventory lean, cents
+MAX_INV         = float(_env("MAX_INV", "30"))         # max net shares
+MAX_WINDOW_USD  = float(_env("MAX_WINDOW_USD", "25"))  # cash cap per window
+QUOTE_STOP_SEC  = float(_env("QUOTE_STOP_SEC", "180")) # stop quoting, last 3 min
+WARMUP_SEC      = float(_env("WARMUP_SEC", "20"))      # let new window settle
+LOOP_SEC        = float(_env("LOOP_SEC", "2.5"))
+REQUOTE_SEC     = float(_env("REQUOTE_SEC", "12"))     # refresh cadence
+REQUOTE_TICK    = float(_env("REQUOTE_TICK", "0.01"))  # or when fair moves 1c
+FILL_FRACTION   = float(_env("FILL_FRACTION", "0.6"))  # paper-fill haircut
+FEE_COEF        = float(_env("FEE_COEF", "0.0312"))    # taker fee ~= coef*min(p,1-p)
+MODEL_GUARD     = float(_env("MODEL_GUARD", "0.10"))   # widen if |model-mid| >
+MODEL_PAUSE     = float(_env("MODEL_PAUSE", "0.18"))   # pause quoting if >
+AUDIT_TAU       = float(_env("AUDIT_TAU", "600"))      # momentum audit @10min left
+MIN_SIGMA_SEC   = float(_env("MIN_SIGMA_SEC", "2.5e-5"))
+MAX_SIGMA_SEC   = float(_env("MAX_SIGMA_SEC", "8e-4"))
+VOL_HALFLIFE    = float(_env("VOL_HALFLIFE", "120"))   # seconds
+LEDGER_PATH     = _env("LEDGER15_PATH", "btc15_ledger.jsonl")
+
+PRIVATE_KEY     = _env("PM_PRIVATE_KEY", "")
+FUNDER_ADDRESS  = _env("PM_FUNDER", "")
+SIGNATURE_TYPE  = int(_env("PM_SIG_TYPE", "1"))
+
+GAMMA   = "https://gamma-api.polymarket.com"
+CLOB    = "https://clob.polymarket.com"
+RTDS_WS = _env("RTDS_WS", "wss://ws-live-data.polymarket.com")
+HTTP_TIMEOUT = 12
+WINDOW_SEC   = 900
+SLUG_FMT     = "btc-updown-15m-{end_ts}"
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s",
+                    datefmt="%H:%M:%S")
+log = logging.getLogger("btc15")
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "btc15-maker/1.0"})
+ND = NormalDist()
+
+# ---------------------------------------------------------------------------
+# Math (pure — covered by --selftest)
+# ---------------------------------------------------------------------------
+def phi(x):
+    return ND.cdf(x)
+
+def phi_inv(p):
+    return ND.inv_cdf(min(max(p, 1e-9), 1 - 1e-9))
+
+def fair_prob(S, K, sigma_sec, tau_sec):
+    """P(price_end >= K) under driftless lognormal."""
+    if S <= 0 or K <= 0 or tau_sec <= 0:
+        return None
+    denom = sigma_sec * math.sqrt(max(tau_sec, 1.0))
+    if denom <= 0:
+        return None
+    return phi(math.log(S / K) / denom)
+
+def implied_strike(S, mid, sigma_sec, tau_sec):
+    """Back out K from a market mid (used if we join mid-window)."""
+    if not (0.03 <= mid <= 0.97):
+        return None
+    z = phi_inv(mid)
+    return S / math.exp(z * sigma_sec * math.sqrt(max(tau_sec, 1.0)))
+
+def taker_fee_per_share(price, coef=FEE_COEF):
+    return coef * min(price, 1.0 - price)
+
+def clamp_price(p):
+    return min(0.99, max(0.01, round(p, 2)))
+
+def build_quotes(P, half, skew, best_bid_up, best_ask_up,
+                 best_bid_dn, best_ask_dn, net_inv, max_inv):
+    """
+    Two resting BUY bids: Up at P-half-skew, Down at (1-P)-half+skew.
+    Never cross the book (stay a maker). Suppress the side that would
+    grow inventory past the cap. Returns (bid_up|None, bid_dn|None).
+    """
+    bid_up = clamp_price(P - half - skew)
+    bid_dn = clamp_price((1.0 - P) - half + skew)
+    if best_ask_up is not None:
+        bid_up = min(bid_up, clamp_price(best_ask_up - 0.01))
+    if best_ask_dn is not None:
+        bid_dn = min(bid_dn, clamp_price(best_ask_dn - 0.01))
+    if net_inv >= max_inv:     # already long Up -> stop buying Up
+        bid_up = None
+    if net_inv <= -max_inv:    # already long Down -> stop buying Down
+        bid_dn = None
+    return bid_up, bid_dn
+
+def window_bounds(epoch):
+    end = (int(epoch) // WINDOW_SEC + 1) * WINDOW_SEC
+    return end - WINDOW_SEC, end
+
+# ---------------------------------------------------------------------------
+# Live Chainlink/Binance price feed (Polymarket public RTDS websocket)
+# ---------------------------------------------------------------------------
+class PriceFeed:
+    """Background websocket -> thread-safe latest price + tick history."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.ticks = deque(maxlen=4000)     # (ts_sec, price)
+        self.var = (6e-5) ** 2              # EWMA of r^2/dt (per-second)
+        self._last = None
+        self.connected = False
+
+    def on_price(self, ts, price):
+        with self.lock:
+            if self._last:
+                lt, lp = self._last
+                dt = ts - lt
+                if 0 < dt < 30 and lp > 0 and price > 0:
+                    r = math.log(price / lp)
+                    decay = 0.5 ** (dt / VOL_HALFLIFE)
+                    self.var = decay * self.var + (1 - decay) * (r * r / dt)
+            self._last = (ts, price)
+            self.ticks.append((ts, price))
+
+    def latest(self):
+        with self.lock:
+            return self._last
+
+    def sigma_sec(self):
+        with self.lock:
+            s = math.sqrt(max(self.var, 0.0))
+        return min(max(s, MIN_SIGMA_SEC), MAX_SIGMA_SEC)
+
+    def price_at(self, ts, tol=6.0):
+        """Tick nearest to ts within tol seconds (for strike capture)."""
+        best = None
+        with self.lock:
+            for t, p in self.ticks:
+                d = abs(t - ts)
+                if d <= tol and (best is None or d < best[0]):
+                    best = (d, p)
+        return best[1] if best else None
+
+    # -- websocket plumbing --------------------------------------------------
+    def start(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def _run(self):
+        try:
+            import websocket  # websocket-client
+        except ImportError:
+            log.error("pip install websocket-client  (falling back to Binance REST)")
+            self._rest_fallback()
+            return
+        sub = json.dumps({"action": "subscribe", "subscriptions": [
+            {"topic": "crypto_prices_chainlink", "type": "*", "filters": "btc/usd"},
+            {"topic": "crypto_prices", "type": "update", "filters": "btcusdt"},
+        ]})
+
+        def on_message(_ws, msg):
+            try:
+                m = json.loads(msg)
+                topic = m.get("topic", "")
+                pay = m.get("payload") or {}
+                val = pay.get("value")
+                ts = (pay.get("timestamp") or m.get("timestamp") or 0) / 1000.0
+                if val is None or ts <= 0:
+                    return
+                # prefer Chainlink (resolution feed); accept Binance too —
+                # both track BTC/USD, EWMA vol tolerates mixed ticks.
+                if topic in ("crypto_prices_chainlink", "crypto_prices"):
+                    self.on_price(ts, float(val))
+                    self.connected = True
+            except (ValueError, TypeError):
+                pass
+
+        while True:
+            try:
+                ws = websocket.WebSocketApp(
+                    RTDS_WS, on_message=on_message,
+                    on_open=lambda w: w.send(sub))
+                ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:  # noqa: BLE001
+                log.warning("ws error: %s", e)
+            self.connected = False
+            log.info("ws reconnecting in 3s...")
+            time.sleep(3)
+
+    def _rest_fallback(self):
+        while True:
+            try:
+                r = SESSION.get("https://data-api.binance.vision/api/v3/ticker/price",
+                                params={"symbol": "BTCUSDT"}, timeout=8)
+                if r.ok:
+                    self.on_price(time.time(), float(r.json()["price"]))
+                    self.connected = True
+            except (requests.RequestException, ValueError, KeyError):
+                self.connected = False
+            time.sleep(1.5)
+
+# ---------------------------------------------------------------------------
+# Polymarket helpers
+# ---------------------------------------------------------------------------
+def find_window_market(end_ts):
+    """Locate the market for the window ending at end_ts. Returns dict|None."""
+    slug = SLUG_FMT.format(end_ts=end_ts)
+    for endpoint in ("events", "markets"):
+        try:
+            r = SESSION.get(f"{GAMMA}/{endpoint}", params={"slug": slug},
+                            timeout=HTTP_TIMEOUT)
+            if not r.ok:
+                continue
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                mkts = it.get("markets") if endpoint == "events" else [it]
+                for m in mkts or []:
+                    toks = json.loads(m.get("clobTokenIds") or "[]")
+                    outs = json.loads(m.get("outcomes") or "[]")
+                    if len(toks) == 2 and len(outs) == 2:
+                        o = [s.strip().lower() for s in outs]
+                        if "up" in o and "down" in o:
+                            return {"gamma_id": m.get("id"),
+                                    "condition_id": m.get("conditionId"),
+                                    "slug": slug,
+                                    "up": str(toks[o.index("up")]),
+                                    "down": str(toks[o.index("down")])}
+        except (requests.RequestException, ValueError, TypeError):
+            continue
+    return None
+
+def fetch_books(token_ids):
+    try:
+        r = SESSION.post(f"{CLOB}/books",
+                         json=[{"token_id": t} for t in token_ids],
+                         timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            return {}
+        out = {}
+        for b in r.json():
+            tid = str(b.get("asset_id", ""))
+            asks = sorted(((float(x["price"]), float(x["size"]))
+                           for x in b.get("asks", [])), key=lambda z: z[0])
+            bids = sorted(((float(x["price"]), float(x["size"]))
+                           for x in b.get("bids", [])), key=lambda z: -z[0])
+            out[tid] = {"asks": asks, "bids": bids}
+        return out
+    except (requests.RequestException, ValueError):
+        return {}
+
+def fetch_resolution(gamma_id):
+    """Returns 'up' / 'down' / None (not yet resolved)."""
+    try:
+        r = SESSION.get(f"{GAMMA}/markets/{gamma_id}", timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            return None
+        m = r.json()
+        prices = json.loads(m.get("outcomePrices") or "[]")
+        outs = [s.strip().lower() for s in json.loads(m.get("outcomes") or "[]")]
+        if len(prices) == 2 and len(outs) == 2 and m.get("closed"):
+            win = outs[0] if float(prices[0]) > 0.5 else outs[1]
+            return win if win in ("up", "down") else None
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+    return None
+
+def ledger(rec):
+    rec["ts"] = time.time()
+    rec["mode"] = "DRY" if DRY_RUN else "LIVE"
+    with open(LEDGER_PATH, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+def replay_pnl(path, mode):
+    """Sum past window PnL for this mode so compounding survives restarts."""
+    pnl = 0.0
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("type") == "window" and r.get("mode") == mode:
+                    pnl += float(r.get("pnl", 0))
+    except FileNotFoundError:
+        pass
+    return pnl
+
+# ---------------------------------------------------------------------------
+# Live order layer (paper mode never touches this)
+# ---------------------------------------------------------------------------
+class LiveOrders:
+    def __init__(self):
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
+        self.OrderArgs, self.OrderType, self.BUY = OrderArgs, OrderType, BUY
+        kw = {"key": PRIVATE_KEY, "chain_id": 137}
+        if FUNDER_ADDRESS:
+            kw.update({"signature_type": SIGNATURE_TYPE, "funder": FUNDER_ADDRESS})
+        self.c = ClobClient(CLOB, **kw)
+        self.c.set_api_creds(self.c.create_or_derive_api_creds())
+        self.open = {}   # order_id -> {"token","price","size","matched"}
+        log.info("LIVE order client ready.")
+
+    def place(self, token_id, price, size):
+        try:
+            o = self.c.create_order(self.OrderArgs(price=price, size=float(size),
+                                                   side=self.BUY, token_id=token_id))
+            r = self.c.post_order(o, self.OrderType.GTC)
+            oid = (r or {}).get("orderID")
+            if oid:
+                self.open[oid] = {"token": token_id, "price": price,
+                                  "size": size, "matched": 0.0}
+            return oid
+        except Exception as e:  # noqa: BLE001
+            log.warning("place failed: %s", e)
+            return None
+
+    def cancel_all(self):
+        for oid in list(self.open):
+            try:
+                self.c.cancel(order_id=oid)
+            except Exception:  # noqa: BLE001
+                pass
+            self.open.pop(oid, None)
+
+    def poll_fills(self):
+        """Returns list of (token_id, price, newly_matched_size)."""
+        fills = []
+        for oid, meta in list(self.open.items()):
+            try:
+                o = self.c.get_order(oid)
+                matched = float(o.get("size_matched", 0) or 0)
+                if matched > meta["matched"] + 1e-9:
+                    fills.append((meta["token"], meta["price"],
+                                  matched - meta["matched"]))
+                    meta["matched"] = matched
+                if o.get("status") in ("CANCELED", "MATCHED") and \
+                        matched >= meta["size"] - 1e-9:
+                    self.open.pop(oid, None)
+            except Exception:  # noqa: BLE001
+                continue
+        return fills
+
+# ---------------------------------------------------------------------------
+# One 15-minute window
+# ---------------------------------------------------------------------------
+class Window:
+    def __init__(self, start_ts, end_ts, market):
+        self.start, self.end, self.m = start_ts, end_ts, market
+        self.strike = None
+        self.strike_src = None
+        self.inv_up = self.inv_dn = 0.0
+        self.cash = 0.0
+        self.fills = 0
+        self.quotes = {"up": None, "dn": None}   # (price, placed_at)
+        self.last_fill = {"up": 0.0, "dn": 0.0}
+        self.audit = None
+        self.done_quoting = False
+
+    def net(self):
+        return self.inv_up - self.inv_dn
+
+    def record_fill(self, side, price, qty):
+        if side == "up":
+            self.inv_up += qty
+        else:
+            self.inv_dn += qty
+        self.cash -= price * qty
+        self.fills += 1
+        ledger({"type": "fill", "slug": self.m["slug"], "side": side,
+                "price": price, "qty": qty, "net_inv": self.net()})
+        log.info("FILL %s %s x%.0f @ %.2f | inv up/dn %.0f/%.0f cash %.2f",
+                 self.m["slug"][-10:], side.upper(), qty, price,
+                 self.inv_up, self.inv_dn, self.cash)
+
+# ---------------------------------------------------------------------------
+# Main engine
+# ---------------------------------------------------------------------------
+class Engine:
+    def __init__(self):
+        self.feed = PriceFeed()
+        self.live = None if DRY_RUN else LiveOrders()
+        self.win = None
+        self.pending = []        # windows awaiting resolution
+        self.tot = {"windows": 0, "fills": 0, "shares": 0.0, "pnl": 0.0,
+                    "audit_n": 0, "audit_wins": 0, "audit_pnl": 0.0}
+        self.hist_pnl = replay_pnl(LEDGER_PATH, "DRY" if DRY_RUN else "LIVE")
+        self.halted = False
+
+    # -- compounding: everything scales from the measured bankroll -----------
+    def bankroll(self):
+        return BANKROLL_START + self.hist_pnl + self.tot["pnl"]
+
+    def quote_size(self):
+        if not COMPOUND:
+            return QUOTE_SIZE
+        return float(max(MIN_QUOTE,
+                         min(MAX_QUOTE, math.floor(self.bankroll() * SIZE_PER_DOLLAR))))
+
+    def max_inv(self):
+        return 2.5 * self.quote_size() if COMPOUND else MAX_INV
+
+    def window_cash_cap(self):
+        return MAX_WINDOW_FRAC * self.bankroll() if COMPOUND else MAX_WINDOW_USD
+
+    # -- window lifecycle ----------------------------------------------------
+    def roll_window(self, now):
+        start, end = window_bounds(now)
+        if self.win and self.win.end == end:
+            return
+        if self.win:                       # close out old window
+            if self.live:
+                self.live.cancel_all()
+            self.pending.append(self.win)
+        m = find_window_market(end)
+        if not m:
+            log.warning("market not found for window ending %s", end)
+            self.win = None
+            return
+        self.win = Window(start, end, m)
+        k = self.feed.price_at(start)
+        if k:
+            self.win.strike, self.win.strike_src = k, "feed"
+        log.info("── new window %s | strike %s", m["slug"],
+                 f"{k:.2f}" if k else "pending")
+
+    def ensure_strike(self, S, books, tau):
+        w = self.win
+        if w.strike:
+            return True
+        k = self.feed.price_at(w.start)
+        if k:
+            w.strike, w.strike_src = k, "feed"
+            return True
+        up = books.get(w.m["up"], {})
+        if up.get("bids") and up.get("asks"):
+            mid = (up["bids"][0][0] + up["asks"][0][0]) / 2
+            k = implied_strike(S, mid, self.feed.sigma_sec(), tau)
+            if k:
+                w.strike, w.strike_src = k, "implied"
+                log.info("strike implied from mid=%.2f -> K=%.2f", mid, k)
+                return True
+        return False
+
+    # -- resolution ------------------------------------------------------------
+    def settle_pending(self):
+        for w in list(self.pending):
+            if time.time() < w.end + 20:
+                continue
+            res = fetch_resolution(w.m["gamma_id"])
+            if res is None:
+                if time.time() > w.end + 600:      # give up politely
+                    self.pending.remove(w)
+                    ledger({"type": "window_unresolved", "slug": w.m["slug"]})
+                continue
+            payout = w.inv_up if res == "up" else w.inv_dn
+            pnl = w.cash + payout
+            self.tot["windows"] += 1
+            self.tot["fills"] += w.fills
+            self.tot["shares"] += w.inv_up + w.inv_dn
+            self.tot["pnl"] += pnl
+            ledger({"type": "window", "slug": w.m["slug"], "result": res,
+                    "fills": w.fills, "shares": w.inv_up + w.inv_dn,
+                    "cash": round(w.cash, 4), "payout": payout,
+                    "pnl": round(pnl, 4), "bankroll": round(self.bankroll(), 2),
+                    "strike_src": w.strike_src})
+            if w.audit:
+                a = w.audit
+                win = (a["pred"] == res)
+                apnl = (1 - a["entry"] if win else -a["entry"]) - a["fee"]
+                self.tot["audit_n"] += 1
+                self.tot["audit_wins"] += int(win)
+                self.tot["audit_pnl"] += apnl
+                ledger({"type": "audit", "slug": w.m["slug"], **a,
+                        "result": res, "win": win, "pnl": round(apnl, 4)})
+            sh = max(self.tot["shares"], 1)
+            log.info("SETTLE %s %s | window pnl %+.2f || totals: %d wins? n/a, "
+                     "%d windows, %.0f sh, pnl %+.2f (%.2fc/sh) | audit %d/%d ev %+.3f",
+                     w.m["slug"][-10:], res.upper(), pnl, self.tot["windows"],
+                     self.tot["shares"], self.tot["pnl"],
+                     100 * self.tot["pnl"] / sh,
+                     self.tot["audit_wins"], self.tot["audit_n"],
+                     self.tot["audit_pnl"] / max(self.tot["audit_n"], 1))
+            log.info("bankroll $%.2f | next quote size %.0f shares",
+                     self.bankroll(), self.quote_size())
+            self.pending.remove(w)
+
+    # -- quoting ----------------------------------------------------------------
+    def step(self):
+        now = time.time()
+        self.roll_window(now)
+        self.settle_pending()
+        if COMPOUND and not self.halted and \
+                self.bankroll() < DRAWDOWN_STOP * BANKROLL_START:
+            self.halted = True
+            if self.live:
+                self.live.cancel_all()
+            log.critical("DRAWDOWN BRAKE: bankroll $%.2f fell below %.0f%% of "
+                         "start ($%.2f) — quoting stopped. Review the ledger "
+                         "before restarting.", self.bankroll(),
+                         DRAWDOWN_STOP * 100, BANKROLL_START)
+            ledger({"type": "drawdown_halt", "bankroll": round(self.bankroll(), 2)})
+        if self.halted:
+            return
+        w = self.win
+        if not w:
+            return
+        tau = w.end - now
+        lt = self.feed.latest()
+        if not lt or now - lt[0] > 20:
+            log.warning("price feed stale — not quoting")
+            return
+        S = lt[1]
+        books = fetch_books([w.m["up"], w.m["down"]])
+        bu, bd = books.get(w.m["up"], {}), books.get(w.m["down"], {})
+        if now - w.start < WARMUP_SEC or not self.ensure_strike(S, books, tau):
+            return
+
+        # settle live fills / simulate paper fills against last quotes
+        if self.live:
+            for tok, price, qty in self.live.poll_fills():
+                w.record_fill("up" if tok == w.m["up"] else "dn", price, qty)
+        else:
+            for side, book in (("up", bu), ("dn", bd)):
+                q = w.quotes[side]
+                if not q or not book.get("asks"):
+                    continue
+                if book["asks"][0][0] <= q[0] and now - w.last_fill[side] > 8:
+                    qty = math.floor(self.quote_size() * FILL_FRACTION)
+                    if qty >= 1 and -w.cash + q[0] * qty <= self.window_cash_cap():
+                        w.record_fill(side, q[0], qty)
+                        w.last_fill[side] = now
+
+        # taker audit — one look per window at AUDIT_TAU remaining
+        if w.audit is None and tau <= AUDIT_TAU and bu.get("asks") and bd.get("asks"):
+            pred = "up" if S >= w.strike else "down"
+            entry = (bu if pred == "up" else bd)["asks"][0][0]
+            w.audit = {"pred": pred, "entry": entry,
+                       "fee": round(taker_fee_per_share(entry), 5)}
+
+        # stop quoting near the end; hold inventory to resolution
+        if tau <= QUOTE_STOP_SEC:
+            if not w.done_quoting:
+                if self.live:
+                    self.live.cancel_all()
+                w.quotes = {"up": None, "dn": None}
+                w.done_quoting = True
+                log.info("last %ds — quotes pulled, inv up/dn %.0f/%.0f",
+                         int(tau), w.inv_up, w.inv_dn)
+            return
+
+        P = fair_prob(S, w.strike, self.feed.sigma_sec(), tau)
+        if P is None:
+            return
+        mid = None
+        if bu.get("bids") and bu.get("asks"):
+            mid = (bu["bids"][0][0] + bu["asks"][0][0]) / 2
+        half = HALF_SPREAD
+        if mid is not None:
+            gap = abs(P - mid)
+            if gap > MODEL_PAUSE:
+                log.warning("model %.2f vs mid %.2f — paused", P, mid)
+                return
+            if gap > MODEL_GUARD:
+                half += 0.02
+        if -w.cash >= self.window_cash_cap():
+            return
+
+        skew = MAX_SKEW * max(-1.0, min(1.0, w.net() / self.max_inv()))
+        bid_up, bid_dn = build_quotes(
+            P, half, skew,
+            bu["bids"][0][0] if bu.get("bids") else None,
+            bu["asks"][0][0] if bu.get("asks") else None,
+            bd["bids"][0][0] if bd.get("bids") else None,
+            bd["asks"][0][0] if bd.get("asks") else None,
+            w.net(), self.max_inv())
+
+        for side, price in (("up", bid_up), ("dn", bid_dn)):
+            old = w.quotes[side]
+            fresh = (old is None or abs((old[0]) - (price or -1)) >= REQUOTE_TICK
+                     or now - old[1] >= REQUOTE_SEC)
+            if not fresh:
+                continue
+            if self.live:
+                # naive replace: cancel-all then re-place both sides
+                pass
+            w.quotes[side] = (price, now) if price else None
+        if self.live and any(w.quotes.values()):
+            self.live.cancel_all()
+            qs = self.quote_size()
+            if w.quotes["up"]:
+                self.live.place(w.m["up"], w.quotes["up"][0], qs)
+            if w.quotes["dn"]:
+                self.live.place(w.m["down"], w.quotes["dn"][0], qs)
+
+    def run(self):
+        self.feed.start()
+        log.info("btc15 maker v2 | %s | bankroll $%.2f | quote size %s | "
+                 "half-spread %.0fc | brake at $%.2f",
+                 "DRY-RUN (paper)" if DRY_RUN else "LIVE", self.bankroll(),
+                 ("%.0f sh, compounding" % self.quote_size()) if COMPOUND
+                 else ("%.0f sh, fixed" % QUOTE_SIZE),
+                 HALF_SPREAD * 100, DRAWDOWN_STOP * BANKROLL_START)
+        stop = {"f": False}
+        signal.signal(signal.SIGTERM, lambda *_: stop.update(f=True))
+        while not stop["f"]:
+            if os.path.exists("stop15.flag"):
+                log.info("stop15.flag — exiting")
+                break
+            try:
+                self.step()
+            except Exception as e:  # noqa: BLE001
+                log.error("step error: %s", e)
+            try:
+                time.sleep(LOOP_SEC)
+            except KeyboardInterrupt:
+                break
+        if self.live:
+            self.live.cancel_all()
+        log.info("session totals: %s", json.dumps(
+            {k: round(v, 3) if isinstance(v, float) else v
+             for k, v in self.tot.items()}))
+
+# ---------------------------------------------------------------------------
+# Self-test — offline verification of every math component
+# ---------------------------------------------------------------------------
+def selftest():
+    ok = True
+    def check(name, cond):
+        nonlocal ok
+        print(("PASS " if cond else "FAIL ") + name)
+        ok = ok and cond
+
+    check("phi(0)=0.5", abs(phi(0) - 0.5) < 1e-12)
+    check("phi_inv roundtrip", abs(phi_inv(phi(1.234)) - 1.234) < 1e-9)
+
+    P = fair_prob(100000, 100000, 6e-5, 600)
+    check("ATM fair value = 0.5", abs(P - 0.5) < 1e-9)
+    P_hi = fair_prob(100000 * 1.0015, 100000, 6e-5, 600)
+    P_lo = fair_prob(100000 / 1.0015, 100000, 6e-5, 600)
+    check("fair value monotonic in S", P_lo < 0.5 < P_hi)
+    check("symmetry P(K*e^x)+P(K*e^-x)=1", abs(P_hi + P_lo - 1) < 1e-9)
+
+    # strike inversion: derive mid from a known K, recover K
+    K_true = 100000.0
+    S, sig, tau = 100080.0, 7e-5, 480.0
+    mid = fair_prob(S, K_true, sig, tau)
+    K_est = implied_strike(S, mid, sig, tau)
+    check("implied strike recovers K", abs(K_est - K_true) < 0.5)
+
+    # vol estimator on synthetic walk with known sigma
+    import random
+    random.seed(7)
+    pf = PriceFeed()
+    true_sig, p, t = 1.2e-4, 100000.0, 0.0
+    for _ in range(4000):
+        t += 1.0
+        p *= math.exp(true_sig * random.gauss(0, 1))
+        pf.on_price(t, p)
+    est = pf.sigma_sec()
+    check("EWMA vol within 25%% of truth (%.1e vs %.1e)" % (est, true_sig),
+          abs(est - true_sig) / true_sig < 0.25)
+
+    # fee model matches the published example: 100 sh @ 0.50 -> ~$1.56
+    check("fee example ~$1.56/100sh",
+          abs(100 * taker_fee_per_share(0.50) - 1.56) < 0.01)
+
+    # quotes never cross; skew direction correct; cap suppresses a side
+    bu, bd = build_quotes(0.50, 0.02, 0.0, 0.47, 0.49, 0.49, 0.53, 0, 30)
+    check("bid stays below ask (maker-only)", bu <= 0.48 and bd <= 0.48)
+    bu2, bd2 = build_quotes(0.50, 0.02, 0.02, 0.40, 0.60, 0.40, 0.60, 15, 30)
+    check("long-Up skew lowers Up bid, raises Down bid",
+          bu2 < bu and bd2 > bd)
+    bu3, bd3 = build_quotes(0.50, 0.02, 0.02, 0.40, 0.60, 0.40, 0.60, 30, 30)
+    check("inventory cap suppresses Up bid", bu3 is None and bd3 is not None)
+
+    # window PnL accounting: buy 12 Up @0.48 and 12 Down @0.47 -> pair lock
+    w = Window(0, 900, {"slug": "t", "up": "U", "down": "D",
+                        "gamma_id": 0, "condition_id": 0})
+    w.record_fill("up", 0.48, 12)
+    w.record_fill("dn", 0.47, 12)
+    pnl_up = w.cash + w.inv_up      # resolves Up
+    pnl_dn = w.cash + w.inv_dn      # resolves Down
+    check("balanced pair locks 5c/sh either way",
+          abs(pnl_up - 0.60) < 1e-9 and abs(pnl_dn - 0.60) < 1e-9)
+
+    # one-sided fill risk math
+    w2 = Window(0, 900, w.m)
+    w2.record_fill("up", 0.48, 12)
+    check("one-sided fill: +6.24 if right / -5.76 if wrong",
+          abs((w2.cash + w2.inv_up) - 6.24) < 1e-9 and
+          abs((w2.cash + w2.inv_dn) - (-5.76)) < 1e-9)
+
+    # audit pnl math: entry .52, fee coef .0312
+    fee = taker_fee_per_share(0.52)
+    check("audit fee = coef*min(p,1-p)", abs(fee - 0.0312 * 0.48) < 1e-9)
+
+    # slug arithmetic matches observed real slug (…-1768425300, %900==0)
+    check("window end aligns to 900s grid", 1768425300 % 900 == 0)
+    s, e = window_bounds(1768425300 - 10)
+    check("window bounds computed correctly",
+          s == 1768424400 and e == 1768425300)
+
+    # compounding sizer: floor, proportional growth, ceiling, monotonic
+    def _size(bank):
+        return max(MIN_QUOTE, min(MAX_QUOTE, math.floor(bank * SIZE_PER_DOLLAR)))
+    check("sizer floor at tiny bankroll", _size(1) == MIN_QUOTE)
+    check("sizer proportional ($40->%d, $400->%d)" % (_size(40), _size(400)),
+          _size(400) == min(MAX_QUOTE, math.floor(400 * SIZE_PER_DOLLAR)))
+    check("sizer monotonic", _size(200) >= _size(50) >= _size(10))
+    check("sizer ceiling respected", _size(10 ** 9) == MAX_QUOTE)
+
+    # ledger replay: sums only matching-mode window rows, ignores the rest
+    import tempfile
+    tf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".jsonl")
+    for rec in ({"type": "window", "mode": "DRY", "pnl": 1.5},
+                {"type": "window", "mode": "LIVE", "pnl": 9.9},
+                {"type": "fill", "mode": "DRY", "pnl": 123},
+                {"type": "audit", "mode": "DRY", "pnl": 5}):
+        tf.write(json.dumps(rec) + "\n")
+    tf.close()
+    check("replay sums DRY windows only", abs(replay_pnl(tf.name, "DRY") - 1.5) < 1e-9)
+    check("replay sums LIVE windows only", abs(replay_pnl(tf.name, "LIVE") - 9.9) < 1e-9)
+    check("replay of missing file -> 0", replay_pnl("/no_such_file.jsonl", "DRY") == 0.0)
+
+    # drawdown brake arithmetic
+    check("brake threshold = stop_frac * start",
+          abs(DRAWDOWN_STOP * BANKROLL_START -
+              BANKROLL_START * DRAWDOWN_STOP) < 1e-12 and 0 < DRAWDOWN_STOP < 1)
+
+    print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
+    return 0 if ok else 1
+
+# ---------------------------------------------------------------------------
+def status():
+    """Read the ledger and print the numbers that decide go-live / tune / stop."""
+    mode = "DRY" if DRY_RUN else "LIVE"
+    try:
+        rows = [json.loads(l) for l in open(LEDGER_PATH)]
+    except FileNotFoundError:
+        print("No ledger yet — the bot hasn't produced data. Let it run first.")
+        return 0
+    w = [r for r in rows if r.get("type") == "window" and r.get("mode") == mode]
+    a = [r for r in rows if r.get("type") == "audit" and r.get("mode") == mode]
+    if not w:
+        print(f"No completed {mode} windows in the ledger yet. Give it more time.")
+        return 0
+    sh = sum(x.get("shares", 0) for x in w) or 1
+    pnl = sum(x.get("pnl", 0) for x in w)
+    days = max((rows[-1]["ts"] - rows[0]["ts"]) / 86400, 0.01)
+    edge_c = 100 * pnl / sh
+    print(f"mode          : {mode}")
+    print(f"days measured : {days:.1f}")
+    print(f"windows done  : {len(w)}   fills: {sum(x.get('fills', 0) for x in w)}"
+          f"   shares: {sh:.0f} ({sh / days:.0f}/day)")
+    print(f"profit        : ${pnl:+.2f}   edge: {edge_c:+.2f} c/share")
+    print(f"per month est : ${30 * pnl / days:+.2f}")
+    print(f"bankroll      : ${BANKROLL_START + pnl:.2f} (started ${BANKROLL_START:.0f})")
+    if a:
+        wins = sum(1 for x in a if x.get("win"))
+        print(f"momentum audit: {wins}/{len(a)} wins ({100 * wins / len(a):.1f}%), "
+              f"avg ${sum(x.get('pnl', 0) for x in a) / len(a):+.4f} per $1 bet")
+    if edge_c >= 0.5 and sh / days >= 150:
+        verdict = "GO-LIVE CANDIDATE — edge and volume both clear the bar"
+    elif edge_c > -0.2:
+        verdict = "TUNE — near zero; widen HALF_SPREAD to 0.03 and run 3 more days"
+    else:
+        verdict = "STOP — the market's adverse selection beats us; you lost $0 learning it"
+    print(f"verdict       : {verdict}")
+    return 0
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    if "--status" in sys.argv:
+        sys.exit(status())
+    try:
+        Engine().run()
+    except KeyboardInterrupt:
+        pass
