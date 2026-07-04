@@ -46,6 +46,7 @@ V2 — SELF-COMPOUNDING
 
 Run:    python3 btc15_maker.py               (env vars below)
 Status: python3 btc15_maker.py --status      (your results + verdict, anytime)
+Feed:   python3 btc15_maker.py --feedtest    (20s live check of the price feed)
 Test:   python3 btc15_maker.py --selftest    (offline math checks)
 Stop:   Ctrl-C, or `touch stop15.flag`
 """
@@ -171,16 +172,53 @@ def window_bounds(epoch):
     return end - WINDOW_SEC, end
 
 # ---------------------------------------------------------------------------
-# Live Chainlink/Binance price feed (Polymarket public RTDS websocket)
+# Live Chainlink/Binance price feed (Polymarket public RTDS websocket,
+# with an always-on Binance REST backup that takes over if the ws is quiet)
 # ---------------------------------------------------------------------------
+def parse_rtds(raw):
+    """Parse one RTDS frame into [(ts_sec, price), ...] BTC ticks.
+    Pure function — covered by --selftest. Ignores PONG/acks/other symbols."""
+    try:
+        m = json.loads(raw)
+    except (ValueError, TypeError):
+        return []                       # "PONG" or non-JSON keepalive
+    out = []
+    for item in (m if isinstance(m, list) else [m]):
+        if not isinstance(item, dict):
+            continue
+        if not str(item.get("topic", "")).startswith("crypto_prices"):
+            continue
+        pay = item.get("payload") or item.get("data") or {}
+        if not isinstance(pay, dict):
+            continue
+        sym = str(pay.get("symbol", pay.get("pair", ""))).lower()
+        if "btc" not in sym:
+            continue
+        try:
+            price = float(pay.get("value", pay.get("price")))
+        except (TypeError, ValueError):
+            continue
+        ts = pay.get("timestamp") or item.get("timestamp") or time.time() * 1000
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            ts = time.time() * 1000
+        if ts > 1e11:                   # milliseconds -> seconds
+            ts /= 1000.0
+        out.append((ts, price))
+    return out
+
 class PriceFeed:
-    """Background websocket -> thread-safe latest price + tick history."""
+    """Background websocket + REST backup -> thread-safe price + history."""
     def __init__(self):
         self.lock = threading.Lock()
         self.ticks = deque(maxlen=4000)     # (ts_sec, price)
         self.var = (6e-5) ** 2              # EWMA of r^2/dt (per-second)
         self._last = None
         self.connected = False
+        self.ws_ts = 0.0                    # last time the websocket delivered
+        self.src = {"ws": 0, "rest": 0}     # tick counts per source
+        self._raw_seen = 0
 
     def on_price(self, ts, price):
         with self.lock:
@@ -213,62 +251,74 @@ class PriceFeed:
                     best = (d, p)
         return best[1] if best else None
 
-    # -- websocket plumbing --------------------------------------------------
+    # -- feed plumbing --------------------------------------------------------
     def start(self):
-        t = threading.Thread(target=self._run, daemon=True)
-        t.start()
+        threading.Thread(target=self._rest_poll, daemon=True).start()
+        threading.Thread(target=self._run_ws, daemon=True).start()
 
-    def _run(self):
+    def _run_ws(self):
         try:
             import websocket  # websocket-client
         except ImportError:
-            log.error("pip install websocket-client  (falling back to Binance REST)")
-            self._rest_fallback()
+            log.error("websocket-client not installed — running on REST backup only")
             return
+        # Official RTDS schema: filters is a JSON *string*; empty = all symbols
+        # (we filter to BTC client-side, which survives symbol-format changes).
         sub = json.dumps({"action": "subscribe", "subscriptions": [
-            {"topic": "crypto_prices_chainlink", "type": "*", "filters": "btc/usd"},
-            {"topic": "crypto_prices", "type": "update", "filters": "btcusdt"},
+            {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""},
+            {"topic": "crypto_prices", "type": "*", "filters": ""},
         ]})
 
+        def on_open(ws):
+            ws.send(sub)
+            log.info("rtds subscribed (chainlink + binance topics)")
+
+            def pinger():           # RTDS requires app-level PING every ~5s
+                while getattr(ws, "keep_running", True):
+                    try:
+                        ws.send("PING")
+                    except Exception:  # noqa: BLE001
+                        return
+                    time.sleep(5)
+            threading.Thread(target=pinger, daemon=True).start()
+
         def on_message(_ws, msg):
-            try:
-                m = json.loads(msg)
-                topic = m.get("topic", "")
-                pay = m.get("payload") or {}
-                val = pay.get("value")
-                ts = (pay.get("timestamp") or m.get("timestamp") or 0) / 1000.0
-                if val is None or ts <= 0:
-                    return
-                # prefer Chainlink (resolution feed); accept Binance too —
-                # both track BTC/USD, EWMA vol tolerates mixed ticks.
-                if topic in ("crypto_prices_chainlink", "crypto_prices"):
-                    self.on_price(ts, float(val))
-                    self.connected = True
-            except (ValueError, TypeError):
-                pass
+            if msg == "PONG":
+                return
+            if self._raw_seen < 3:
+                self._raw_seen += 1
+                log.info("rtds sample frame: %.200s", msg)
+            for ts, price in parse_rtds(msg):
+                self.on_price(ts, price)
+                self.ws_ts = time.time()
+                self.src["ws"] += 1
+                self.connected = True
 
         while True:
             try:
-                ws = websocket.WebSocketApp(
-                    RTDS_WS, on_message=on_message,
-                    on_open=lambda w: w.send(sub))
+                ws = websocket.WebSocketApp(RTDS_WS, on_open=on_open,
+                                            on_message=on_message)
                 ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:  # noqa: BLE001
                 log.warning("ws error: %s", e)
-            self.connected = False
-            log.info("ws reconnecting in 3s...")
+            log.info("ws reconnecting in 3s (REST backup active meanwhile)...")
             time.sleep(3)
 
-    def _rest_fallback(self):
+    def _rest_poll(self):
+        """Always-on Binance REST backup. Injects prices only while the
+        websocket has been quiet for >6s, so sources never mix noisily."""
         while True:
-            try:
-                r = SESSION.get("https://data-api.binance.vision/api/v3/ticker/price",
-                                params={"symbol": "BTCUSDT"}, timeout=8)
-                if r.ok:
-                    self.on_price(time.time(), float(r.json()["price"]))
-                    self.connected = True
-            except (requests.RequestException, ValueError, KeyError):
-                self.connected = False
+            if time.time() - self.ws_ts > 6:
+                try:
+                    r = SESSION.get(
+                        "https://data-api.binance.vision/api/v3/ticker/price",
+                        params={"symbol": "BTCUSDT"}, timeout=8)
+                    if r.ok:
+                        self.on_price(time.time(), float(r.json()["price"]))
+                        self.src["rest"] += 1
+                        self.connected = True
+                except (requests.RequestException, ValueError, KeyError):
+                    pass
             time.sleep(1.5)
 
 # ---------------------------------------------------------------------------
@@ -583,7 +633,10 @@ class Engine:
         tau = w.end - now
         lt = self.feed.latest()
         if not lt or now - lt[0] > 20:
-            log.warning("price feed stale — not quoting")
+            if now - getattr(self, "_stale_log", 0) > 30:
+                self._stale_log = now
+                log.warning("price feed stale — not quoting (auto-retrying; "
+                            "run --feedtest to diagnose)")
             return
         S = lt[1]
         books = fetch_books([w.m["up"], w.m["down"]])
@@ -803,6 +856,31 @@ def selftest():
           abs(DRAWDOWN_STOP * BANKROLL_START -
               BANKROLL_START * DRAWDOWN_STOP) < 1e-12 and 0 < DRAWDOWN_STOP < 1)
 
+    # RTDS parser: exact documented chainlink frame
+    doc_frame = json.dumps({"topic": "crypto_prices_chainlink", "type": "update",
+                            "timestamp": 1753314088421,
+                            "payload": {"symbol": "btc/usd",
+                                        "timestamp": 1753314088395,
+                                        "value": 67234.50}})
+    t = parse_rtds(doc_frame)
+    check("rtds parses documented btc frame",
+          len(t) == 1 and abs(t[0][1] - 67234.50) < 1e-9)
+    check("rtds converts ms timestamp to seconds",
+          abs(t[0][0] - 1753314088.395) < 1e-6)
+    eth = doc_frame.replace("btc/usd", "eth/usd")
+    check("rtds filters out non-BTC symbols", parse_rtds(eth) == [])
+    check("rtds ignores PONG/non-JSON", parse_rtds("PONG") == [])
+    bnb = json.dumps({"topic": "crypto_prices", "payload":
+                      {"symbol": "btcusdt", "value": 109000.1,
+                       "timestamp": 1753314088}})
+    t2 = parse_rtds(bnb)
+    check("rtds parses binance topic + seconds ts",
+          len(t2) == 1 and abs(t2[0][0] - 1753314088) < 1e-6)
+    check("rtds handles list frames",
+          len(parse_rtds("[" + doc_frame + "," + bnb + "]")) == 2)
+    check("rtds ignores subscription acks",
+          parse_rtds(json.dumps({"type": "subscribed", "topic": "crypto_prices"})) == [])
+
     print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     return 0 if ok else 1
 
@@ -845,11 +923,38 @@ def status():
     return 0
 
 # ---------------------------------------------------------------------------
+def feedtest():
+    """20-second live check of the price feed (websocket + REST backup)."""
+    pf = PriceFeed()
+    pf.start()
+    print("Listening for BTC prices for 20 seconds...")
+    for i in range(4):
+        time.sleep(5)
+        lt = pf.latest()
+        line = (f"  t+{(i + 1) * 5:2d}s | ws ticks: {pf.src['ws']:4d} | "
+                f"rest ticks: {pf.src['rest']:3d}")
+        if lt:
+            line += f" | last BTC: {lt[1]:,.2f} | sigma/s: {pf.sigma_sec():.2e}"
+        print(line)
+    total = pf.src["ws"] + pf.src["rest"]
+    if pf.src["ws"] > 0:
+        print("RESULT: PASS — websocket (Chainlink) feed is flowing. Ideal.")
+    elif total > 0:
+        print("RESULT: PASS — REST backup is flowing (websocket quiet). "
+              "Bot works; check journalctl for 'rtds sample frame' lines and send them to Claude.")
+    else:
+        print("RESULT: FAIL — no prices from either source. Check the server's "
+              "internet access, then send this output to Claude.")
+    return 0 if total > 0 else 1
+
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(selftest())
     if "--status" in sys.argv:
         sys.exit(status())
+    if "--feedtest" in sys.argv:
+        sys.exit(feedtest())
     try:
         Engine().run()
     except KeyboardInterrupt:
