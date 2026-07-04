@@ -92,6 +92,9 @@ FILL_FRACTION   = float(_env("FILL_FRACTION", "0.6"))  # paper-fill haircut
 FEE_COEF        = float(_env("FEE_COEF", "0.0312"))    # taker fee ~= coef*min(p,1-p)
 MODEL_GUARD     = float(_env("MODEL_GUARD", "0.10"))   # widen if |model-mid| >
 MODEL_PAUSE     = float(_env("MODEL_PAUSE", "0.18"))   # pause quoting if >
+MAX_FILLS_PER_SIDE = int(_env("MAX_FILLS_PER_SIDE", "4"))  # per window, paper mode
+MAX_BOOK_SPREAD = float(_env("MAX_BOOK_SPREAD", "0.10"))   # wider = junk book, ignore mid
+RESOLVE_FEED_AFTER = float(_env("RESOLVE_FEED_AFTER", "45"))  # s after end -> self-resolve
 AUDIT_TAU       = float(_env("AUDIT_TAU", "600"))      # momentum audit @10min left
 MIN_SIGMA_SEC   = float(_env("MIN_SIGMA_SEC", "2.5e-5"))
 MAX_SIGMA_SEC   = float(_env("MAX_SIGMA_SEC", "8e-4"))
@@ -147,6 +150,27 @@ def taker_fee_per_share(price, coef=FEE_COEF):
 
 def clamp_price(p):
     return min(0.99, max(0.01, round(p, 2)))
+
+def book_mid(book, max_spread=None):
+    """Midprice only when the book is informative; junk/wide books -> None.
+    A book of bid 0.02 / ask 1.00 has mid 0.51 but means nothing."""
+    if max_spread is None:
+        max_spread = MAX_BOOK_SPREAD
+    bids, asks = book.get("bids") or [], book.get("asks") or []
+    if not bids or not asks:
+        return None
+    bb, ba = bids[0][0], asks[0][0]
+    if ba - bb > max_spread:
+        return None
+    return (bb + ba) / 2
+
+def paper_fill_ok(crossed_now, crossed_prev, bid_px, last_fill_px,
+                  fills_done, max_fills):
+    """A simulated fill needs a FRESH crossing (or a new quote price) and a
+    per-window cap — real orders get consumed; ours must not refill forever."""
+    if not crossed_now or fills_done >= max_fills:
+        return False
+    return (not crossed_prev) or (bid_px != last_fill_px)
 
 def build_quotes(P, half, skew, best_bid_up, best_ask_up,
                  best_bid_dn, best_ask_dn, net_inv, max_inv):
@@ -479,6 +503,9 @@ class Window:
         self.fills = 0
         self.quotes = {"up": None, "dn": None}   # (price, placed_at)
         self.last_fill = {"up": 0.0, "dn": 0.0}
+        self.last_fill_px = {"up": None, "dn": None}
+        self.crossed = {"up": False, "dn": False}
+        self.fill_count = {"up": 0, "dn": 0}
         self.audit = None
         self.done_quoting = False
 
@@ -558,8 +585,8 @@ class Engine:
             w.strike, w.strike_src = k, "feed"
             return True
         up = books.get(w.m["up"], {})
-        if up.get("bids") and up.get("asks"):
-            mid = (up["bids"][0][0] + up["asks"][0][0]) / 2
+        mid = book_mid(up)
+        if mid is not None:
             k = implied_strike(S, mid, self.feed.sigma_sec(), tau)
             if k:
                 w.strike, w.strike_src = k, "implied"
@@ -572,10 +599,20 @@ class Engine:
         for w in list(self.pending):
             if time.time() < w.end + 20:
                 continue
-            res = fetch_resolution(w.m["gamma_id"])
+            res, src = fetch_resolution(w.m["gamma_id"]), "gamma"
+            if res is None and time.time() > w.end + RESOLVE_FEED_AFTER \
+                    and w.strike:
+                # self-resolve using the same Chainlink rule the market uses:
+                # Up if price(end) >= price(start)
+                p_end = self.feed.price_at(w.end, tol=12)
+                if p_end is not None:
+                    res, src = ("up" if p_end >= w.strike else "down"), "feed"
             if res is None:
-                if time.time() > w.end + 600:      # give up politely
+                if time.time() > w.end + 600:      # give up loudly, not silently
                     self.pending.remove(w)
+                    log.warning("window %s UNRESOLVED after 10min — dropped "
+                                "(no gamma result, no feed tick at end)",
+                                w.m["slug"][-10:])
                     ledger({"type": "window_unresolved", "slug": w.m["slug"]})
                 continue
             payout = w.inv_up if res == "up" else w.inv_dn
@@ -588,7 +625,7 @@ class Engine:
                     "fills": w.fills, "shares": w.inv_up + w.inv_dn,
                     "cash": round(w.cash, 4), "payout": payout,
                     "pnl": round(pnl, 4), "bankroll": round(self.bankroll(), 2),
-                    "strike_src": w.strike_src})
+                    "res_src": src, "strike_src": w.strike_src})
             if w.audit:
                 a = w.audit
                 win = (a["pred"] == res)
@@ -606,8 +643,8 @@ class Engine:
                      100 * self.tot["pnl"] / sh,
                      self.tot["audit_wins"], self.tot["audit_n"],
                      self.tot["audit_pnl"] / max(self.tot["audit_n"], 1))
-            log.info("bankroll $%.2f | next quote size %.0f shares",
-                     self.bankroll(), self.quote_size())
+            log.info("bankroll $%.2f | next quote size %.0f shares | resolved via %s",
+                     self.bankroll(), self.quote_size(), src)
             self.pending.remove(w)
 
     # -- quoting ----------------------------------------------------------------
@@ -652,12 +689,20 @@ class Engine:
             for side, book in (("up", bu), ("dn", bd)):
                 q = w.quotes[side]
                 if not q or not book.get("asks"):
+                    w.crossed[side] = False
                     continue
-                if book["asks"][0][0] <= q[0] and now - w.last_fill[side] > 8:
+                crossed = book["asks"][0][0] <= q[0]
+                if paper_fill_ok(crossed, w.crossed[side], q[0],
+                                 w.last_fill_px[side], w.fill_count[side],
+                                 MAX_FILLS_PER_SIDE) \
+                        and now - w.last_fill[side] > 8:
                     qty = math.floor(self.quote_size() * FILL_FRACTION)
                     if qty >= 1 and -w.cash + q[0] * qty <= self.window_cash_cap():
                         w.record_fill(side, q[0], qty)
                         w.last_fill[side] = now
+                        w.last_fill_px[side] = q[0]
+                        w.fill_count[side] += 1
+                w.crossed[side] = crossed
 
         # taker audit — one look per window at AUDIT_TAU remaining
         if w.audit is None and tau <= AUDIT_TAU and bu.get("asks") and bd.get("asks"):
@@ -680,14 +725,19 @@ class Engine:
         P = fair_prob(S, w.strike, self.feed.sigma_sec(), tau)
         if P is None:
             return
-        mid = None
-        if bu.get("bids") and bu.get("asks"):
-            mid = (bu["bids"][0][0] + bu["asks"][0][0]) / 2
+        mid = book_mid(bu)
         half = HALF_SPREAD
         if mid is not None:
             gap = abs(P - mid)
             if gap > MODEL_PAUSE:
-                log.warning("model %.2f vs mid %.2f — paused", P, mid)
+                if now - getattr(self, "_pause_log", 0) > 30:
+                    self._pause_log = now
+                    log.warning("model %.2f vs mid %.2f — quoting paused, "
+                                "quotes pulled", P, mid)
+                if self.live:
+                    self.live.cancel_all()
+                w.quotes = {"up": None, "dn": None}
+                w.crossed = {"up": False, "dn": False}
                 return
             if gap > MODEL_GUARD:
                 half += 0.02
@@ -880,6 +930,28 @@ def selftest():
           len(parse_rtds("[" + doc_frame + "," + bnb + "]")) == 2)
     check("rtds ignores subscription acks",
           parse_rtds(json.dumps({"type": "subscribed", "topic": "crypto_prices"})) == [])
+
+    # book_mid: tight books give a mid, junk/wide/empty books give None
+    check("mid of tight book", abs(book_mid({"bids": [(0.48, 5)], "asks": [(0.52, 5)]},
+                                            0.10) - 0.50) < 1e-9)
+    check("junk book (0.02/1.00) -> no mid",
+          book_mid({"bids": [(0.02, 5)], "asks": [(1.00, 5)]}, 0.10) is None)
+    check("empty book -> no mid", book_mid({"bids": [], "asks": []}, 0.10) is None)
+
+    # paper fill gating: no machine-gun refills on the same crossing
+    check("fill on fresh cross", paper_fill_ok(True, False, 0.49, None, 0, 4))
+    check("NO refill while still crossed at same price",
+          not paper_fill_ok(True, True, 0.49, 0.49, 1, 4))
+    check("refill allowed at a new quote price",
+          paper_fill_ok(True, True, 0.47, 0.49, 1, 4))
+    check("per-side cap enforced", not paper_fill_ok(True, False, 0.49, None, 4, 4))
+
+    # self-resolution rule matches the market: Up if end >= strike (ties -> Up)
+    def _res(p_end, k):
+        return "up" if p_end >= k else "down"
+    check("self-resolve up", _res(62510.0, 62500.0) == "up")
+    check("self-resolve down", _res(62490.0, 62500.0) == "down")
+    check("self-resolve tie counts as up", _res(62500.0, 62500.0) == "up")
 
     print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     return 0 if ok else 1
