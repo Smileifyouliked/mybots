@@ -85,7 +85,10 @@ MAX_SKEW        = float(_env("MAX_SKEW", "0.02"))      # inventory lean, cents
 MAX_INV         = float(_env("MAX_INV", "30"))         # max net shares
 MAX_WINDOW_USD  = float(_env("MAX_WINDOW_USD", "25"))  # cash cap per window
 QUOTE_STOP_SEC  = float(_env("QUOTE_STOP_SEC", "180")) # stop quoting, last 3 min
-WARMUP_SEC      = float(_env("WARMUP_SEC", "20"))      # let new window settle
+WARMUP_SEC      = float(_env("WARMUP_SEC", "150"))     # opening blackout: the
+                                                        # first minutes belong to
+                                                        # informed flow — sit out
+STOP_PROB       = float(_env("STOP_PROB", "0.22"))     # cut naked side below 22%
 LOOP_SEC        = float(_env("LOOP_SEC", "2.5"))
 REQUOTE_SEC     = float(_env("REQUOTE_SEC", "12"))     # refresh cadence
 REQUOTE_TICK    = float(_env("REQUOTE_TICK", "0.01"))  # or when fair moves 1c
@@ -514,6 +517,52 @@ def ledger(rec):
     with open(LEDGER_PATH, "a") as f:
         f.write(json.dumps(rec) + "\n")
 
+def fit_trust(pairs, lo=0.25, hi=1.0):
+    """Least-squares fit of the trust factor: given (prediction-0.5, outcome)
+    pairs, how much of our signal was actually real? A bot whose 80% calls
+    win only 60% earns a trust factor of ~0.33 — computed, not guessed."""
+    sxx = sum(x * x for x, _ in pairs)
+    if sxx <= 0:
+        return None
+    lam = sum(x * (y - 0.5) for x, y in pairs) / sxx
+    return min(hi, max(lo, lam))
+
+def replay_calib(path, mode, cap=400):
+    """(prediction-0.5, outcome) pairs from past rounds — learning survives
+    restarts because it is recomputed from the ledger itself."""
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if (r.get("type") == "window" and r.get("mode") == mode
+                        and r.get("p_raw") is not None):
+                    out.append((float(r["p_raw"]) - 0.5,
+                                1.0 if r.get("result") == "up" else 0.0))
+    except FileNotFoundError:
+        pass
+    return out[-cap:]
+
+def replay_recent(path, mode, n=60):
+    """Recent (shares, pnl) per round, for spread adaptation."""
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("type") == "window" and r.get("mode") == mode:
+                    out.append((float(r.get("shares", 0)),
+                                float(r.get("pnl", 0))))
+    except FileNotFoundError:
+        pass
+    return out[-n:]
+
 def replay_pnl(path, mode):
     """Sum past window PnL for this mode so compounding survives restarts."""
     pnl = 0.0
@@ -537,8 +586,9 @@ class LiveOrders:
     def __init__(self):
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
-        self.OrderArgs, self.OrderType, self.BUY = OrderArgs, OrderType, BUY
+        from py_clob_client.order_builder.constants import BUY, SELL
+        self.OrderArgs, self.OrderType = OrderArgs, OrderType
+        self.BUY, self.SELL = BUY, SELL
         kw = {"key": PRIVATE_KEY, "chain_id": 137}
         if FUNDER_ADDRESS:
             kw.update({"signature_type": SIGNATURE_TYPE, "funder": FUNDER_ADDRESS})
@@ -560,6 +610,16 @@ class LiveOrders:
         except Exception as e:  # noqa: BLE001
             log.warning("place failed: %s", e)
             return None
+
+    def sell_fak(self, token_id, price, size):
+        """Best-effort immediate sale (used by the cut-loss rule)."""
+        try:
+            o = self.c.create_order(self.OrderArgs(
+                price=max(0.01, round(price, 2)), size=float(size),
+                side=self.SELL, token_id=token_id))
+            self.c.post_order(o, self.OrderType.FAK)
+        except Exception as e:  # noqa: BLE001
+            log.warning("cut-loss sell failed: %s", e)
 
     def cancel_all(self):
         for oid in list(self.open):
@@ -605,6 +665,8 @@ class Window:
         self.crossed = {"up": False, "dn": False}
         self.fill_count = {"up": 0, "dn": 0}
         self.audit = None
+        self.p_raw = None
+        self.cut = {"up": False, "dn": False}
         self.done_quoting = False
 
     def net(self):
@@ -641,6 +703,18 @@ class Engine:
         self.hist_pnl = replay_pnl(LEDGER_PATH, "DRY" if DRY_RUN else "LIVE")
         self.halted = False
         self.verify_q = []   # feed-scored rounds awaiting official confirmation
+        mode = "DRY" if DRY_RUN else "LIVE"
+        self.mr_damp = MR_DAMP           # trust factor — learned over time
+        self.half = HALF_SPREAD          # quoted discount — learned over time
+        self.calib = replay_calib(LEDGER_PATH, mode)
+        self.recent = deque(replay_recent(LEDGER_PATH, mode), maxlen=60)
+        self._learn_at = 0
+        if len(self.calib) >= 60:
+            t = fit_trust(self.calib)
+            if t is not None:
+                self.mr_damp = round(t, 3)
+                log.info("📚 Resumed learning from %d past rounds — trust "
+                         "factor %.2f", len(self.calib), self.mr_damp)
 
     # -- compounding: everything scales from the measured bankroll -----------
     def bankroll(self):
@@ -740,7 +814,15 @@ class Engine:
                     "fills": w.fills, "shares": w.inv_up + w.inv_dn,
                     "cash": round(w.cash, 4), "payout": payout,
                     "pnl": round(pnl, 4), "bankroll": round(self.bankroll(), 2),
+                    "p_raw": round(w.p_raw, 4) if w.p_raw is not None else None,
                     "res_src": src, "strike_src": w.strike_src})
+            if w.p_raw is not None:
+                self.calib.append((w.p_raw - 0.5, 1.0 if res == "up" else 0.0))
+                self.calib = self.calib[-400:]
+            self.recent.append((w.inv_up + w.inv_dn, pnl))
+            if self.tot["windows"] >= self._learn_at + 20:
+                self._learn_at = self.tot["windows"]
+                self._relearn()
             if w.audit:
                 a = w.audit
                 win = (a["pred"] == res)
@@ -781,6 +863,35 @@ class Engine:
                                       "slug": w.m["slug"], "res": res,
                                       "end": w.end, "t": time.time()})
             self.pending.remove(w)
+
+    def _relearn(self):
+        """Every 20 rounds: recalibrate trust from the track record and adapt
+        the quoted spread to fill profitability. Slow, clamped, logged —
+        and it can never touch the brake, caps, or pair guard."""
+        if len(self.calib) >= 60:
+            target = fit_trust(self.calib)
+            if target is not None:
+                new = round(0.8 * self.mr_damp + 0.2 * target, 3)
+                if abs(new - self.mr_damp) >= 0.02:
+                    log.info("📚 LEARNED from %d rounds: my predictions "
+                             "deserve %s trust — trust factor %.2f -> %.2f",
+                             len(self.calib),
+                             "less" if new < self.mr_damp else "more",
+                             self.mr_damp, new)
+                    self.mr_damp = new
+        sh = sum(s for s, _ in self.recent)
+        if sh >= 150:
+            edge = 100 * sum(p for _, p in self.recent) / sh
+            if edge < -0.5 and self.half < 0.04:
+                self.half = round(self.half + 0.005, 3)
+                log.info("📚 LEARNED: recent fills losing (%+.2f¢/share) — "
+                         "quoting more cautiously (discount now %.1f¢)",
+                         edge, self.half * 100)
+            elif edge > 1.0 and self.half > 0.02:
+                self.half = round(self.half - 0.005, 3)
+                log.info("📚 LEARNED: recent fills healthy (%+.2f¢/share) — "
+                         "quoting slightly tighter (discount now %.1f¢)",
+                         edge, self.half * 100)
 
     def verify_officials(self):
         """A few minutes after a feed-scored round, compare with the OFFICIAL
@@ -872,6 +983,7 @@ class Engine:
             entry = (bu if pred == "up" else bd)["asks"][0][0]
             w.audit = {"pred": pred, "entry": entry,
                        "fee": round(taker_fee_per_share(entry), 5)}
+            w.p_raw = fair_prob(S, w.strike, self.feed.sigma_sec(), tau)
 
         # stop quoting near the end; hold inventory to resolution
         if tau <= QUOTE_STOP_SEC:
@@ -892,9 +1004,9 @@ class Engine:
         P = fair_prob(S, w.strike, self.feed.sigma_sec(), tau)
         if P is None:
             return
-        P = 0.5 + (P - 0.5) * MR_DAMP      # respect 15-min mean reversion
+        P = 0.5 + (P - 0.5) * self.mr_damp   # trust factor: learned, not guessed
         mid = book_mid(bu)
-        half = HALF_SPREAD
+        half = self.half
         if mid is not None:
             gap = abs(P - mid)
             if gap > MODEL_PAUSE:
@@ -915,6 +1027,31 @@ class Engine:
         if -w.cash >= self.window_cash_cap():
             return
 
+        net = w.net()
+        if abs(net) >= 3 and tau > QUOTE_STOP_SEC:
+            side = "up" if net > 0 else "dn"
+            prob = P if net > 0 else 1.0 - P
+            book = bu if side == "up" else bd
+            if prob < STOP_PROB and not w.cut[side] and book.get("bids"):
+                bid_px, bid_sz = book["bids"][0]
+                qty = min(abs(net), math.floor(bid_sz))
+                if qty >= 1:
+                    if side == "up":
+                        w.inv_up -= qty
+                    else:
+                        w.inv_dn -= qty
+                    w.cash += bid_px * qty
+                    w.cut[side] = True
+                    if self.live:
+                        self.live.sell_fak(
+                            w.m["up" if side == "up" else "down"], bid_px, qty)
+                    ledger({"type": "cut", "slug": w.m["slug"], "side": side,
+                            "price": bid_px, "qty": qty})
+                    log.info("✂️ CUT LOSS: sold %d %s at %.0f¢ — that side is "
+                             "down to %.0f%% and riding it is how rounds bleed",
+                             qty, "UP" if side == "up" else "DOWN",
+                             bid_px * 100, prob * 100)
+
         skew = MAX_SKEW * max(-1.0, min(1.0, w.net() / self.max_inv()))
         bid_up, bid_dn = build_quotes(
             P, half, skew,
@@ -924,6 +1061,10 @@ class Engine:
             bd["asks"][0][0] if bd.get("asks") else None,
             w.net(), self.max_inv())
 
+        if w.cut["up"]:
+            bid_up = None
+        if w.cut["dn"]:
+            bid_dn = None
         if w.inv_dn > 0 and bid_up is not None:
             cap = 1.0 - (w.cost_dn / w.inv_dn) - PAIR_EDGE
             bid_up = clamp_price(min(bid_up, cap)) if cap >= 0.02 else None
@@ -1183,6 +1324,47 @@ def selftest():
     pfg.on_price(t + 1.0, p * 1.01)          # a 1% glitch jump in one tick
     check("glitch jump ignored by vol estimator",
           abs(pfg.sigma_sec() - s_before) < 1e-12)
+
+    # self-learning: the trust fit must recover known miscalibration exactly
+    # overconfident bot: says 80% (x=0.3) ten times, wins only 6 -> trust 1/3
+    pairs = [(0.3, 1.0)] * 6 + [(0.3, 0.0)] * 4
+    t = fit_trust(pairs)
+    check("trust fit: 80%%-calls-winning-60%% -> ~0.33", abs(t - 1.0 / 3) < 1e-9)
+    perfect = [(0.3, 1.0)] * 8 + [(0.3, 0.0)] * 2   # 80% calls winning 80%
+    check("trust fit: perfectly calibrated -> 1.0 (clamped)",
+          fit_trust(perfect) == 1.0)
+    check("trust fit: clamp floor at 0.25",
+          fit_trust([(0.3, 0.0)] * 10) == 0.25)
+    check("trust fit: no signal -> None", fit_trust([(0.0, 1.0)] * 5) is None)
+
+    # learning survives restarts: replay reads it back from the ledger
+    import tempfile as _tf
+    lf = _tf.NamedTemporaryFile("w", delete=False, suffix=".jsonl")
+    lf.write(json.dumps({"type": "window", "mode": "DRY", "result": "up",
+                         "p_raw": 0.8, "shares": 12, "pnl": 0.5}) + "\n")
+    lf.write(json.dumps({"type": "window", "mode": "DRY", "result": "down",
+                         "p_raw": 0.7, "shares": 6, "pnl": -0.3}) + "\n")
+    lf.write(json.dumps({"type": "window", "mode": "LIVE", "result": "up",
+                         "p_raw": 0.9, "shares": 3, "pnl": 1.0}) + "\n")
+    lf.close()
+    cal = replay_calib(lf.name, "DRY")
+    check("calib replay: DRY rounds only, correct pairs",
+          len(cal) == 2 and abs(cal[0][0] - 0.3) < 1e-9 and cal[0][1] == 1.0
+          and cal[1][1] == 0.0)
+    rec = replay_recent(lf.name, "DRY")
+    check("recent replay: shares+pnl recovered",
+          rec == [(12.0, 0.5), (6.0, -0.3)])
+
+    # cut-loss arithmetic: selling the naked side halves the worst case
+    wc = Window(0, 900, {"slug": "t", "up": "U", "down": "D",
+                         "gamma_id": 0, "condition_id": 0})
+    wc.record_fill("dn", 0.45, 9)          # naked 9 DOWN @ 45c = -$4.05 risk
+    wc.inv_dn -= 9
+    wc.cash += 0.20 * 9                    # cut at 20c bid
+    check("cut-loss halves the damage (-4.05 -> -2.25)",
+          abs((wc.cash + wc.inv_up) - (-2.25)) < 1e-9)
+    check("stop-prob threshold sane", 0.0 < STOP_PROB < 0.5)
+    check("opening blackout >= 2 minutes", WARMUP_SEC >= 120)
 
     # market lookup verification: only a matching end time is accepted
     from datetime import datetime, timezone as _tz
