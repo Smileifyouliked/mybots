@@ -179,6 +179,12 @@ def paper_fill_ok(crossed_now, crossed_prev, bid_px, last_fill_px,
         return False
     return (not crossed_prev) or (bid_px != last_fill_px)
 
+def avail_at_or_below(asks, px):
+    """Shares REALLY offered at or below px. A paper fill can never exceed
+    what the book actually contained — no more 105-share fills from 3-share
+    dust asks."""
+    return sum(s for p, s in asks if p <= px)
+
 def build_quotes(P, half, skew, best_bid_up, best_ask_up,
                  best_bid_dn, best_ask_dn, net_inv, max_inv):
     """
@@ -243,7 +249,8 @@ class PriceFeed:
     """Background websocket + REST backup -> thread-safe price + history."""
     def __init__(self):
         self.lock = threading.Lock()
-        self.ticks = deque(maxlen=4000)     # (ts_sec, price)
+        self.ticks = deque(maxlen=4000)     # (ts_sec, price) — all sources
+        self.cl = deque(maxlen=4000)        # Chainlink-only (resolution feed)
         self.var = (6e-5) ** 2              # EWMA of r^2/dt (per-second)
         self._last = None
         self.connected = False
@@ -273,14 +280,19 @@ class PriceFeed:
         return min(max(s, MIN_SIGMA_SEC), MAX_SIGMA_SEC)
 
     def price_at(self, ts, tol=6.0):
-        """Tick nearest to ts within tol seconds (for strike capture)."""
-        best = None
-        with self.lock:
-            for t, p in self.ticks:
-                d = abs(t - ts)
-                if d <= tol and (best is None or d < best[0]):
-                    best = (d, p)
-        return best[1] if best else None
+        """Tick nearest to ts within tol seconds. Prefers the Chainlink-only
+        stream (the market's actual resolution feed); falls back to the mixed
+        stream only if no Chainlink tick is close enough."""
+        for source in (self.cl, self.ticks):
+            best = None
+            with self.lock:
+                for t, p in source:
+                    d = abs(t - ts)
+                    if d <= tol and (best is None or d < best[0]):
+                        best = (d, p)
+            if best:
+                return best[1]
+        return None
 
     # -- feed plumbing --------------------------------------------------------
     def start(self):
@@ -320,8 +332,12 @@ class PriceFeed:
                 self._raw_seen += 1
                 log.info("🔍 First data sample (technical, safe to ignore): "
                          "%.160s", msg)
+            is_cl = '"crypto_prices_chainlink"' in msg
             for ts, price in parse_rtds(msg):
                 self.on_price(ts, price)
+                if is_cl:
+                    with self.lock:
+                        self.cl.append((ts, price))
                 self.ws_ts = time.time()
                 self.src["ws"] += 1
                 self.connected = True
@@ -667,6 +683,15 @@ class Engine:
             log.info("💰 Bankroll $%.2f | all-time %s | next bet %.0f shares | "
                      "momentum-idea test: %s | result via %s",
                      self.bankroll(), tot_txt, self.quote_size(), aud_txt, src)
+            if (self.tot["windows"] >= 20 and sh > 0
+                    and 100 * self.tot["pnl"] / sh > 5
+                    and not getattr(self, "_tgtb_warned", False)):
+                self._tgtb_warned = True
+                log.warning("⚠️ These profits look TOO GOOD TO BE TRUE "
+                            "(%.1f¢/share vs a 2¢ spread) — likely a "
+                            "simulation artifact, not real edge. Do not go "
+                            "live; send logs to Claude.",
+                            100 * self.tot["pnl"] / sh)
             self.pending.remove(w)
 
     # -- quoting ----------------------------------------------------------------
@@ -719,7 +744,9 @@ class Engine:
                                  w.last_fill_px[side], w.fill_count[side],
                                  MAX_FILLS_PER_SIDE) \
                         and now - w.last_fill[side] > 8:
-                    qty = math.floor(self.quote_size() * FILL_FRACTION)
+                    real_avail = avail_at_or_below(book["asks"], q[0])
+                    qty = math.floor(min(self.quote_size(), real_avail)
+                                     * FILL_FRACTION)
                     if qty >= 1 and -w.cash + q[0] * qty <= self.window_cash_cap():
                         w.record_fill(side, q[0], qty)
                         w.last_fill[side] = now
@@ -987,6 +1014,25 @@ def selftest():
     check("self-resolve down", _res(62490.0, 62500.0) == "down")
     check("self-resolve tie counts as up", _res(62500.0, 62500.0) == "up")
 
+    # fill size can never exceed what the book actually offered
+    asks = [(0.47, 3), (0.48, 2), (0.55, 500)]
+    check("available shares counted at/below bid",
+          avail_at_or_below(asks, 0.48) == 5)
+    check("dust ask caps the fill: min(75, 5)*0.6 -> 3 shares",
+          math.floor(min(75, avail_at_or_below(asks, 0.48)) * 0.6) == 3)
+    check("deep book allows full size",
+          math.floor(min(6, avail_at_or_below(asks, 0.60)) * 0.6) == 3
+          and math.floor(min(6, 505) * 0.6) == 3)
+
+    # resolution pricing prefers the Chainlink stream over mixed ticks
+    pf2 = PriceFeed()
+    pf2.ticks.append((1000.0, 62010.0))     # Binance tick
+    pf2.cl.append((1000.0, 62000.0))        # Chainlink tick, same moment
+    check("price_at prefers Chainlink", pf2.price_at(1000.0) == 62000.0)
+    pf3 = PriceFeed()
+    pf3.ticks.append((1000.0, 62010.0))     # only mixed available
+    check("price_at falls back to mixed feed", pf3.price_at(1000.0) == 62010.0)
+
     print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     return 0 if ok else 1
 
@@ -1019,7 +1065,11 @@ def status():
         wins = sum(1 for x in a if x.get("win"))
         print(f"momentum audit: {wins}/{len(a)} wins ({100 * wins / len(a):.1f}%), "
               f"avg ${sum(x.get('pnl', 0) for x in a) / len(a):+.4f} per $1 bet")
-    if edge_c >= 0.5 and sh / days >= 150:
+    if edge_c > 5:
+        verdict = ("⚠️ TOO GOOD TO BE TRUE — %.1f¢/share exceeds what 2¢ "
+                   "spreads can physically earn. This is simulator optimism, "
+                   "not profit. Do NOT go live. Send this output to Claude." % edge_c)
+    elif edge_c >= 0.5 and sh / days >= 150:
         verdict = "GO-LIVE CANDIDATE — edge and volume both clear the bar"
     elif edge_c > -0.2:
         verdict = "TUNE — near zero; widen HALF_SPREAD to 0.03 and run 3 more days"
