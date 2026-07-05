@@ -93,7 +93,11 @@ FILL_FRACTION   = float(_env("FILL_FRACTION", "0.6"))  # paper-fill haircut
 FEE_COEF        = float(_env("FEE_COEF", "0.0312"))    # taker fee ~= coef*min(p,1-p)
 MODEL_GUARD     = float(_env("MODEL_GUARD", "0.10"))   # widen if |model-mid| >
 MODEL_PAUSE     = float(_env("MODEL_PAUSE", "0.18"))   # pause quoting if >
-MAX_FILLS_PER_SIDE = int(_env("MAX_FILLS_PER_SIDE", "4"))  # per window, paper mode
+MAX_FILLS_PER_SIDE = int(_env("MAX_FILLS_PER_SIDE", "3"))  # per window, paper mode
+MR_DAMP         = float(_env("MR_DAMP", "0.65"))   # damp our reaction to moves
+MID_BLEND       = float(_env("MID_BLEND", "0.5"))  # weight on market consensus
+PAIR_EDGE       = float(_env("PAIR_EDGE", "0.02")) # pairs must lock >= 2c
+SAME_SIDE_STEP  = float(_env("SAME_SIDE_STEP", "0.03"))  # refill needs 3c better px
 MAX_BOOK_SPREAD = float(_env("MAX_BOOK_SPREAD", "0.10"))   # wider = junk book, ignore mid
 RESOLVE_FEED_AFTER = float(_env("RESOLVE_FEED_AFTER", "45"))  # s after end -> self-resolve
 AUDIT_TAU       = float(_env("AUDIT_TAU", "600"))      # momentum audit @10min left
@@ -182,12 +186,17 @@ def book_mid(book, max_spread=None):
     return (bb + ba) / 2
 
 def paper_fill_ok(crossed_now, crossed_prev, bid_px, last_fill_px,
-                  fills_done, max_fills):
-    """A simulated fill needs a FRESH crossing (or a new quote price) and a
-    per-window cap — real orders get consumed; ours must not refill forever."""
+                  fills_done, max_fills, min_step=None):
+    """A simulated fill needs a crossing, a per-window cap, and — after the
+    first fill on a side — a price at least min_step BETTER than the last
+    fill. No more chasing ladders one cent at a time."""
+    if min_step is None:
+        min_step = SAME_SIDE_STEP
     if not crossed_now or fills_done >= max_fills:
         return False
-    return (not crossed_prev) or (bid_px != last_fill_px)
+    if last_fill_px is None:
+        return True
+    return bid_px <= last_fill_px - min_step + 1e-9
 
 def avail_at_or_below(asks, px):
     """Shares REALLY offered at or below px. A paper fill can never exceed
@@ -587,6 +596,7 @@ class Window:
         self.strike = None
         self.strike_src = None
         self.inv_up = self.inv_dn = 0.0
+        self.cost_up = self.cost_dn = 0.0
         self.cash = 0.0
         self.fills = 0
         self.quotes = {"up": None, "dn": None}   # (price, placed_at)
@@ -603,8 +613,10 @@ class Window:
     def record_fill(self, side, price, qty):
         if side == "up":
             self.inv_up += qty
+            self.cost_up += price * qty
         else:
             self.inv_dn += qty
+            self.cost_dn += price * qty
         self.cash -= price * qty
         self.fills += 1
         ledger({"type": "fill", "slug": self.m["slug"], "side": side,
@@ -880,6 +892,7 @@ class Engine:
         P = fair_prob(S, w.strike, self.feed.sigma_sec(), tau)
         if P is None:
             return
+        P = 0.5 + (P - 0.5) * MR_DAMP      # respect 15-min mean reversion
         mid = book_mid(bu)
         half = HALF_SPREAD
         if mid is not None:
@@ -898,6 +911,7 @@ class Engine:
                 return
             if gap > MODEL_GUARD:
                 half += 0.02
+            P = MID_BLEND * mid + (1 - MID_BLEND) * P   # lean on consensus
         if -w.cash >= self.window_cash_cap():
             return
 
@@ -909,6 +923,13 @@ class Engine:
             bd["bids"][0][0] if bd.get("bids") else None,
             bd["asks"][0][0] if bd.get("asks") else None,
             w.net(), self.max_inv())
+
+        if w.inv_dn > 0 and bid_up is not None:
+            cap = 1.0 - (w.cost_dn / w.inv_dn) - PAIR_EDGE
+            bid_up = clamp_price(min(bid_up, cap)) if cap >= 0.02 else None
+        if w.inv_up > 0 and bid_dn is not None:
+            cap = 1.0 - (w.cost_up / w.inv_up) - PAIR_EDGE
+            bid_dn = clamp_price(min(bid_dn, cap)) if cap >= 0.02 else None
 
         for side, price in (("up", bid_up), ("dn", bid_dn)):
             old = w.quotes[side]
@@ -1102,11 +1123,25 @@ def selftest():
 
     # paper fill gating: no machine-gun refills on the same crossing
     check("fill on fresh cross", paper_fill_ok(True, False, 0.49, None, 0, 4))
-    check("NO refill while still crossed at same price",
+    check("NO refill at the same price",
           not paper_fill_ok(True, True, 0.49, 0.49, 1, 4))
-    check("refill allowed at a new quote price",
-          paper_fill_ok(True, True, 0.47, 0.49, 1, 4))
+    check("1c-better refill still blocked (no chasing ladders)",
+          not paper_fill_ok(True, True, 0.48, 0.49, 1, 4))
+    check("3c-better refill allowed",
+          paper_fill_ok(True, True, 0.46, 0.49, 1, 4))
     check("per-side cap enforced", not paper_fill_ok(True, False, 0.49, None, 4, 4))
+
+    # humility math: damping and consensus blending
+    damp = 0.5 + (0.80 - 0.5) * 0.65
+    check("damping shrinks overreaction (0.80 -> ~0.695)", abs(damp - 0.695) < 1e-9)
+    check("damping leaves 50/50 alone", abs((0.5 + 0.0 * 0.65) - 0.5) < 1e-12)
+    blend = 0.5 * 0.60 + 0.5 * damp
+    check("consensus blend midway", abs(blend - (0.60 + damp) / 2) < 1e-12)
+
+    # pair-cost guard: holding DOWN at avg 70c caps the UP bid near 28c
+    cap = 1.0 - (2.10 / 3.0) - 0.02
+    check("pair guard caps opposite bid (avg 70c -> cap 28c)",
+          abs(cap - 0.28) < 1e-9)
 
     # self-resolution rule matches the market: Up if end >= strike (ties -> Up)
     def _res(p_end, k):
