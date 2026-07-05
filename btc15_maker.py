@@ -60,6 +60,7 @@ import signal
 import logging
 import threading
 from collections import deque
+from datetime import datetime
 from statistics import NormalDist
 
 import requests
@@ -120,6 +121,15 @@ logging.getLogger("websocket").setLevel(logging.CRITICAL)  # hide library noise
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "btc15-maker/1.0"})
 ND = NormalDist()
+
+def parse_iso(ts):
+    """Parse an ISO timestamp like '2026-07-05T13:15:00Z' -> datetime|None."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
 
 TZ_OFFSET_H = float(_env("TZ_OFFSET_H", "8"))  # show times in PH time by default
 
@@ -1068,6 +1078,11 @@ def selftest():
     check("deep book allows full size",
           math.floor(min(6, avail_at_or_below(asks, 0.60)) * 0.6) == 3
           and math.floor(min(6, 505) * 0.6) == 3)
+
+    # parse_iso: the helper whose absence once froze the bot — never again
+    d = parse_iso("2026-07-05T13:15:00Z")
+    check("parse_iso reads gamma dates", d is not None and d.timestamp() > 0)
+    check("parse_iso survives junk", parse_iso(None) is None and parse_iso("x") is None)
 
     # market lookup verification: only a matching end time is accepted
     from datetime import datetime, timezone as _tz
