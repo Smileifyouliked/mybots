@@ -373,9 +373,8 @@ class PriceFeed:
 # ---------------------------------------------------------------------------
 # Polymarket helpers
 # ---------------------------------------------------------------------------
-def find_window_market(end_ts):
-    """Locate the market for the window ending at end_ts. Returns dict|None."""
-    slug = SLUG_FMT.format(end_ts=end_ts)
+def _market_from_slug(slug):
+    """Fetch one Up/Down market by slug, including its OFFICIAL end time."""
     for endpoint in ("events", "markets"):
         try:
             r = SESSION.get(f"{GAMMA}/{endpoint}", params={"slug": slug},
@@ -395,10 +394,48 @@ def find_window_market(end_ts):
                             return {"gamma_id": m.get("id"),
                                     "condition_id": m.get("conditionId"),
                                     "slug": slug,
+                                    "end_dt": parse_iso(m.get("endDate")
+                                                        or it.get("endDate")),
                                     "up": str(toks[o.index("up")]),
                                     "down": str(toks[o.index("down")])}
         except (requests.RequestException, ValueError, TypeError):
             continue
+    return None
+
+def slug_matches_window(end_ts, end_dt, tol=120):
+    """Does the fetched market really END when OUR round ends?
+    True/False when verifiable, None when the market has no end time."""
+    if end_dt is None:
+        return None
+    return abs(end_dt.timestamp() - end_ts) <= tol
+
+_slug_mode_logged = False
+
+def find_window_market(end_ts):
+    """Locate the market whose round ENDS at end_ts — VERIFIED, not assumed.
+    The slug's number might encode the round's end OR its start; trading the
+    wrong one means betting on this round while shopping in the next round's
+    still-neutral market. We try both and keep only the market whose official
+    endDate matches our round."""
+    global _slug_mode_logged
+    unverified = None
+    for cand, mode in ((end_ts, "END"), (end_ts - WINDOW_SEC, "START")):
+        m = _market_from_slug(SLUG_FMT.format(end_ts=cand))
+        if not m:
+            continue
+        ok = slug_matches_window(end_ts, m.pop("end_dt", None))
+        if ok:
+            if not _slug_mode_logged:
+                _slug_mode_logged = True
+                log.info("🔎 Market lookup VERIFIED — slug numbers are the "
+                         "round's %s time", mode)
+            return m
+        if ok is None and unverified is None:
+            unverified = m
+    if unverified:
+        log.warning("⚠️ Could not verify this round's market end time — "
+                    "using best guess; treat this round's result with doubt")
+        return unverified
     return None
 
 def fetch_books(token_ids):
@@ -638,6 +675,14 @@ class Engine:
                 p_end = self.feed.price_at(w.end, tol=12)
                 if p_end is not None:
                     res, src = ("up" if p_end >= w.strike else "down"), "feed"
+            if res is not None and src == "gamma" and w.strike:
+                p_end = self.feed.price_at(w.end, tol=12)
+                if p_end is not None:
+                    feed_res = "up" if p_end >= w.strike else "down"
+                    if feed_res != res:
+                        log.warning("ℹ️ Photo-finish: official result %s but "
+                                    "our feed said %s — official result used",
+                                    res.upper(), feed_res.upper())
             if res is None:
                 if time.time() > w.end + 600:      # give up loudly, not silently
                     self.pending.remove(w)
@@ -1023,6 +1068,17 @@ def selftest():
     check("deep book allows full size",
           math.floor(min(6, avail_at_or_below(asks, 0.60)) * 0.6) == 3
           and math.floor(min(6, 505) * 0.6) == 3)
+
+    # market lookup verification: only a matching end time is accepted
+    from datetime import datetime, timezone as _tz
+    dt_ok = datetime.fromtimestamp(1783171800, _tz.utc)
+    dt_next = datetime.fromtimestamp(1783171800 + 900, _tz.utc)
+    check("slug verify: matching end accepted",
+          slug_matches_window(1783171800, dt_ok) is True)
+    check("slug verify: next round's market rejected",
+          slug_matches_window(1783171800, dt_next) is False)
+    check("slug verify: unknown end -> None (unverified)",
+          slug_matches_window(1783171800, None) is None)
 
     # resolution pricing prefers the Chainlink stream over mixed ticks
     pf2 = PriceFeed()
