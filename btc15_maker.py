@@ -265,7 +265,9 @@ class PriceFeed:
         self._last = None
         self.connected = False
         self.ws_ts = 0.0                    # last time the websocket delivered
-        self.src = {"ws": 0, "rest": 0}     # tick counts per source
+        self.cl_ts = 0.0                    # last time CHAINLINK delivered
+        self.fed_ts = 0.0                   # last time the model was fed a tick
+        self.src = {"cl": 0, "ws": 0, "rest": 0}
         self._raw_seen = 0
 
     def on_price(self, ts, price):
@@ -273,12 +275,21 @@ class PriceFeed:
             if self._last:
                 lt, lp = self._last
                 dt = ts - lt
-                if 0 < dt < 30 and lp > 0 and price > 0:
-                    r = math.log(price / lp)
-                    decay = 0.5 ** (dt / VOL_HALFLIFE)
-                    self.var = decay * self.var + (1 - decay) * (r * r / dt)
-            self._last = (ts, price)
+                if dt < 0.2:
+                    # burst ticks: keep freshest price, don't fake volatility
+                    self._last = (lt, price)
+                elif lp > 0 and price > 0:
+                    if dt < 30:
+                        r = math.log(price / lp)
+                        if abs(r) < 0.005:   # ignore glitch jumps >0.5%/tick
+                            decay = 0.5 ** (dt / VOL_HALFLIFE)
+                            self.var = (decay * self.var
+                                        + (1 - decay) * (r * r / dt))
+                    self._last = (ts, price)
+            else:
+                self._last = (ts, price)
             self.ticks.append((ts, price))
+            self.fed_ts = time.time()
 
     def latest(self):
         with self.lock:
@@ -343,13 +354,18 @@ class PriceFeed:
                 log.info("🔍 First data sample (technical, safe to ignore): "
                          "%.160s", msg)
             is_cl = '"crypto_prices_chainlink"' in msg
+            noww = time.time()
             for ts, price in parse_rtds(msg):
-                self.on_price(ts, price)
                 if is_cl:
+                    self.on_price(ts, price)
                     with self.lock:
                         self.cl.append((ts, price))
-                self.ws_ts = time.time()
-                self.src["ws"] += 1
+                    self.cl_ts = noww
+                    self.src["cl"] += 1
+                elif noww - self.cl_ts > 6:   # Binance ws = backup only
+                    self.on_price(ts, price)
+                    self.src["ws"] += 1
+                self.ws_ts = noww
                 self.connected = True
 
         while True:
@@ -367,7 +383,7 @@ class PriceFeed:
         """Always-on Binance REST backup. Injects prices only while the
         websocket has been quiet for >6s, so sources never mix noisily."""
         while True:
-            if time.time() - self.ws_ts > 6:
+            if time.time() - self.fed_ts > 6:
                 try:
                     r = SESSION.get(
                         "https://data-api.binance.vision/api/v3/ticker/price",
@@ -612,6 +628,7 @@ class Engine:
                     "audit_n": 0, "audit_wins": 0, "audit_pnl": 0.0}
         self.hist_pnl = replay_pnl(LEDGER_PATH, "DRY" if DRY_RUN else "LIVE")
         self.halted = False
+        self.verify_q = []   # feed-scored rounds awaiting official confirmation
 
     # -- compounding: everything scales from the measured bankroll -----------
     def bankroll(self):
@@ -747,13 +764,41 @@ class Engine:
                             "simulation artifact, not real edge. Do not go "
                             "live; send logs to Claude.",
                             100 * self.tot["pnl"] / sh)
+            if src == "feed":
+                self.verify_q.append({"gamma_id": w.m["gamma_id"],
+                                      "slug": w.m["slug"], "res": res,
+                                      "end": w.end, "t": time.time()})
             self.pending.remove(w)
+
+    def verify_officials(self):
+        """A few minutes after a feed-scored round, compare with the OFFICIAL
+        result and record any disagreement — honesty telemetry."""
+        noww = time.time()
+        for item in list(self.verify_q):
+            age = noww - item["t"]
+            if age < 240:
+                continue
+            r = fetch_resolution(item["gamma_id"])
+            if r is None:
+                if age > 1200:
+                    self.verify_q.remove(item)
+                continue
+            self.verify_q.remove(item)
+            ledger({"type": "res_check", "slug": item["slug"],
+                    "ours": item["res"], "official": r,
+                    "match": r == item["res"]})
+            if r != item["res"]:
+                log.warning("⚠️ Official result for the %s round was %s but we "
+                            "scored %s — recorded in ledger; frequent "
+                            "mismatches mean tell Claude", fmt_hm(item["end"]),
+                            r.upper(), item["res"].upper())
 
     # -- quoting ----------------------------------------------------------------
     def step(self):
         now = time.time()
         self.roll_window(now)
         self.settle_pending()
+        self.verify_officials()
         if COMPOUND and not self.halted and \
                 self.bankroll() < DRAWDOWN_STOP * BANKROLL_START:
             self.halted = True
@@ -844,7 +889,8 @@ class Engine:
                     self._pause_log = now
                     log.warning("⚠️ The market's odds (%.2f) and my math (%.2f) "
                                 "disagree a lot — standing aside for safety, "
-                                "offers cancelled", mid, P)
+                                "offers cancelled (vol est %.5f/s)",
+                                mid, P, self.feed.sigma_sec())
                 if self.live:
                     self.live.cancel_all()
                 w.quotes = {"up": None, "dn": None}
@@ -1084,6 +1130,25 @@ def selftest():
     check("parse_iso reads gamma dates", d is not None and d.timestamp() > 0)
     check("parse_iso survives junk", parse_iso(None) is None and parse_iso("x") is None)
 
+    # vol hardening: bursts and glitches must never inflate sigma again
+    pfb = PriceFeed()
+    for i in range(200):     # 1ms-apart burst alternating a $12 source basis
+        pfb.on_price(1000.0 + i * 0.001, 62000.0 + (6 if i % 2 else -6))
+    check("burst ticks merged — sigma untouched by feed basis",
+          abs(pfb.sigma_sec() - 6e-5) < 1e-9)
+    import random as _rnd
+    _rnd.seed(1)
+    pfg = PriceFeed()
+    p, t = 62000.0, 0.0
+    for _ in range(600):
+        t += 1.0
+        p *= math.exp(6e-5 * _rnd.gauss(0, 1))
+        pfg.on_price(t, p)
+    s_before = pfg.sigma_sec()
+    pfg.on_price(t + 1.0, p * 1.01)          # a 1% glitch jump in one tick
+    check("glitch jump ignored by vol estimator",
+          abs(pfg.sigma_sec() - s_before) < 1e-12)
+
     # market lookup verification: only a matching end time is accepted
     from datetime import datetime, timezone as _tz
     dt_ok = datetime.fromtimestamp(1783171800, _tz.utc)
@@ -1158,14 +1223,14 @@ def feedtest():
     for i in range(4):
         time.sleep(5)
         lt = pf.latest()
-        line = (f"  t+{(i + 1) * 5:2d}s | ws ticks: {pf.src['ws']:4d} | "
-                f"rest ticks: {pf.src['rest']:3d}")
+        line = (f"  t+{(i + 1) * 5:2d}s | chainlink: {pf.src['cl']:4d} | "
+                f"binance-ws: {pf.src['ws']:3d} | rest: {pf.src['rest']:3d}")
         if lt:
             line += f" | last BTC: {lt[1]:,.2f} | sigma/s: {pf.sigma_sec():.2e}"
         print(line)
-    total = pf.src["ws"] + pf.src["rest"]
-    if pf.src["ws"] > 0:
-        print("RESULT: PASS — websocket (Chainlink) feed is flowing. Ideal.")
+    total = pf.src["cl"] + pf.src["ws"] + pf.src["rest"]
+    if pf.src["cl"] > 0:
+        print("RESULT: PASS — Chainlink feed is flowing. Ideal.")
     elif total > 0:
         print("RESULT: PASS — REST backup is flowing (websocket quiet). "
               "Bot works; check journalctl for 'rtds sample frame' lines and send them to Claude.")
