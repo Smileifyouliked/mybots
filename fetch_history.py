@@ -39,12 +39,20 @@ def fetch_all(target, activity_type):
     out, offset = [], 0
     while offset < MAX_ROWS:
         params = {"user": target, "type": activity_type, "limit": PAGE,
-                  "offset": offset, "sortBy": "TIMESTAMP", "sortDirection": "ASC"}
+                  "offset": offset, "sortBy": "TIMESTAMP",
+                  "sortDirection": "DESC"}  # newest first — the API refuses
+                                            # offsets past ~3500, so DESC keeps
+                                            # the capped window on RECENT form
         for attempt in range(5):
             try:
                 r = requests.get(f"{DATA_API}/activity", params=params, timeout=20)
                 if r.status_code == 429:            # rate limited -> back off
                     time.sleep(3 * (attempt + 1)); continue
+                if r.status_code == 400 and offset > 0:
+                    # server's hard offset cap — not an error, just the end
+                    print(f"  {activity_type}: API offset cap at {offset}; "
+                          f"keeping the newest {len(out)} rows")
+                    return out
                 r.raise_for_status()
                 batch = r.json()
                 break
@@ -130,8 +138,12 @@ def aggregate(trades, redeems, open_condition_ids):
                      "net": round(net, 2),
                      "avg_entry": round(avg_entry, 4),
                      "result": result,
+                     "first_ts": rec["first_ts"],
                      "last_ts": rec["last_ts"]})
-    rows.sort(key=lambda r: r["last_ts"] or 0)       # chronological by close
+    def _t(v):
+        try: return float(v)
+        except (TypeError, ValueError): return 0.0
+    rows.sort(key=lambda r: _t(r["last_ts"]))        # chronological by close
     return rows
 
 
@@ -139,6 +151,21 @@ def summarize(rows, n_raw_trades, n_redeems, target):
     closed = [r for r in rows if r["result"] in ("WIN", "LOSS")]
     wins = [r for r in closed if r["result"] == "WIN"]
     open_rows = [r for r in rows if r["result"] == "OPEN"]
+    with_buys = [r for r in rows if r["bought"] > 0]
+
+    def _f(v):
+        try: return float(v)
+        except (TypeError, ValueError): return None
+    starts = [x for x in (_f(r.get("first_ts")) for r in with_buys) if x]
+    ends = [x for x in (_f(r.get("last_ts")) for r in with_buys) if x]
+
+    def _d(x):
+        if x > 1e12: x = x / 1000          # ms -> s if needed
+        try:
+            return datetime.fromtimestamp(x, tz=timezone.utc).strftime("%Y-%m-%d")
+        except (OSError, OverflowError, ValueError):
+            return "?"
+    window = f"{_d(min(starts))} -> {_d(max(ends))}" if starts and ends else "unknown"
     total_in = sum(r["bought"] for r in rows)
     total_net_closed = sum(r["net"] for r in closed)
 
@@ -166,7 +193,9 @@ def summarize(rows, n_raw_trades, n_redeems, target):
     L.append(f"generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
     L.append("=" * 58)
     L.append(f"raw trades fetched : {n_raw_trades}   redeems: {n_redeems}")
-    L.append(f"distinct markets   : {len(rows)}  (closed {len(closed)}, open {len(open_rows)})")
+    L.append(f"trade window       : {window}   <- check this covers RECENT months")
+    L.append(f"markets w/ buys    : {len(with_buys)}  (closed {len(closed)}, open {len(open_rows)}; "
+             f"+{len(rows) - len(with_buys)} redeem-only rows ignored)")
     L.append(f"total ever spent   : ${total_in:,.2f}")
     L.append(f"net on closed mkts : ${total_net_closed:,.2f}")
     L.append("")
