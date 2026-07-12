@@ -2,27 +2,20 @@
 """
 copybot.py — Polymarket LONGSHOT copy-trader (VPS edition).
 
-Strategy decision (see the scatter-plot analysis):
-  The target runs two books with opposite signs. His cheap YES "unlikely outcome"
-  bets are the profitable cluster; his near-lock NO grinds are the money pit.
-  This bot copies ONLY the cheap longshots and ignores everything else.
+Copies ONLY the target's cheap "unlikely outcome" YES bets (his profitable
+cluster) and ignores his near-lock grinds (his money pit). Dry-run/paper by
+default; set LIVE=1 + keys for real orders.
 
-Why the guardrails matter:
-  His longshots win ~125 : lose ~243. Profit comes from rare 5-9x hits, not
-  steady wins -> fat-tailed. On a $50 stack that's dangerous, so:
-    * cheap-entry gate  : only copy buys at <= MAX_ENTRY_PRICE, and skip if the
-                          price already ran past PAY_MULT x his fill (edge gone).
-    * fractional sizing : each bet is BET_FRACTION of CURRENT bankroll, so bets
-                          shrink after losses and you can't hit exactly zero.
-    * dry-run default   : measure first. Go live only after analyze.py's ruin
-                          simulator says $50 can survive his loss streaks.
+v3 changes (fixes from code review):
+  * REDEEM/settlement: winning bets that resolve to ~$1 now credit the paper
+    bankroll, instead of only losses draining it. (Fixes the "bankroll looks
+    falsely bad" bug.)
+  * seen-trades memory is now ORDER-PRESERVING, so a restart keeps the truly
+    most-recent trades instead of a random slice.
+  * removed dead code (unused size params).
 
-Deploy: push to your `mybots` repo, wget onto the EC2 box. State persists to
-disk so a restart doesn't re-copy old trades or lose position tracking.
-See DEPLOY.md for the systemd unit.
-
-    pip install requests py-clob-client-v2
-    python3 copybot.py --target 0x6297b93ea37ff92a57fd636410f3b71ebf74517e   # dry run
+    pip install --break-system-packages requests py-clob-client-v2
+    python3 copybot.py --target 0x6297b93ea37ff92a57fd636410f3b71ebf74517e   # paper
     LIVE=1 POLY_PK=0x.. POLY_FUNDER=0x.. python3 copybot.py --target 0x..     # real money
 """
 
@@ -32,7 +25,7 @@ import os
 import random
 import sys
 import time
-from collections import deque, defaultdict
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import requests
@@ -44,36 +37,43 @@ DATA_API = "https://data-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 
 POLL_SECONDS = 8
-HEARTBEAT_SECONDS = 3600         # log an equity snapshot at least this often
-STARTING_BANKROLL = 50.0        # your capital in pUSD
+HEARTBEAT_SECONDS = 3600         # log equity + check for resolved bets this often
+STARTING_BANKROLL = 50.0
 
 # --- longshot strategy gates ---
 LONGSHOTS_ONLY   = True
-MAX_ENTRY_PRICE  = 0.20         # only copy his cheap bets (his avg fill ~0.11)
-MIN_ENTRY_PRICE  = 0.02         # skip near-zero dust (usually illiquid junk)
-PAY_MULT         = 1.5          # skip if we'd pay > 1.5x what he paid (edge ran away)
+MAX_ENTRY_PRICE  = 0.20
+MIN_ENTRY_PRICE  = 0.02
+PAY_MULT         = 1.2          # measured edge is ~1.64x per $1 staked; paying
+                                 # 1.5x his price left only ~9% — 1.2x keeps ~37%
+MAX_MARKET_FRAC  = 0.06         # max share of bankroll staked into ONE market
+                                 # (he stacks into single cities; streaks cluster)
 
 # --- risk-of-ruin-aware sizing (fraction of CURRENT bankroll) ---
-BET_FRACTION     = 0.03         # 3% of current bankroll per longshot
-MIN_ORDER        = 1.0          # Polymarket ~$1 min
-MAX_PER_TRADE    = 4.0          # hard ceiling on any single bet
+BET_FRACTION     = 0.03
+MIN_ORDER        = 1.0
+MAX_PER_TRADE    = 4.0
 
-COPY_SELLS       = True         # mirror his exits on tokens we hold
+# --- resolution settlement (paper mode) ---
+RESOLVE_WIN      = 0.97          # held token priced >= this -> treat as resolved WIN
+RESOLVE_LOSS     = 0.03          # held token priced <= this -> treat as resolved LOSS
+
+COPY_SELLS       = True
 STATE_PATH       = "copybot_state.json"
 LOG_PATH         = "copybot_log.jsonl"
+SEEN_KEEP        = 8000          # how many recent trade-keys to remember across restarts
 
 # --- paper-mode fill realism (makes dry-run pessimistic, closer to live) ---
-# Only applied when NOT live. Set REALISTIC_FILLS=False for frictionless paper.
 REALISTIC_FILLS  = True
-PAPER_FILL_MISS  = 0.30         # 30% of cheap-bet orders "don't fill" and are skipped
-PAPER_EXTRA_SLIP = 0.15         # pay 15% worse than shown price on entry (thin book)
-LOW_LIQ_PRICE    = 0.20         # below this price, treat market as thin (apply penalties)
+PAPER_FILL_MISS  = 0.30
+PAPER_EXTRA_SLIP = 0.15
+LOW_LIQ_PRICE    = 0.20
 
-# --- live execution (off until the ruin sim convinces you) ---
+# --- live execution ---
 LIVE = os.environ.get("LIVE", "0") == "1"
 POLY_PK = os.environ.get("POLY_PK")
 POLY_FUNDER = os.environ.get("POLY_FUNDER")
-SIGNATURE_TYPE = int(os.environ.get("SIGNATURE_TYPE", "3"))  # 3 = POLY_1271 deposit wallet
+SIGNATURE_TYPE = int(os.environ.get("SIGNATURE_TYPE", "3"))
 CHAIN_ID = 137
 
 
@@ -85,19 +85,24 @@ def load_state():
         try:
             with open(STATE_PATH) as f:
                 s = json.load(f)
-            s["seen"] = set(s.get("seen", []))
+            # seen is an ORDERED dict-as-set: insertion order == chronological order.
+            s["seen"] = dict.fromkeys(s.get("seen", []))
             s["holdings"] = defaultdict(float, s.get("holdings", {}))
+            s["per_market"] = defaultdict(float, s.get("per_market", {}))
             return s
         except Exception as e:
             print(f"[warn] state unreadable ({e}); starting fresh", file=sys.stderr)
-    return {"seen": set(), "holdings": defaultdict(float),
+    return {"seen": {}, "holdings": defaultdict(float),
+            "per_market": defaultdict(float),
             "bankroll": STARTING_BANKROLL, "initialized": False}
 
 
 def save_state(s):
     try:
-        out = {"seen": list(s["seen"])[-5000:],   # cap file size
+        # keys() preserves insertion order, so [-SEEN_KEEP:] is genuinely the most recent
+        out = {"seen": list(s["seen"].keys())[-SEEN_KEEP:],
                "holdings": {k: v for k, v in s["holdings"].items() if v > 1e-9},
+               "per_market": dict(list(s["per_market"].items())[-2000:]),
                "bankroll": s["bankroll"], "initialized": s["initialized"]}
         tmp = STATE_PATH + ".tmp"
         with open(tmp, "w") as f:
@@ -107,13 +112,95 @@ def save_state(s):
         print(f"[warn] could not save state: {e}", file=sys.stderr)
 
 
+def remember(st, key):
+    st["seen"][key] = None           # add to the ordered set
+
+
+# ----------------------------------------------------------------------------
+# Pretty console output (colored for terminals, plain when piped to journald)
+# ----------------------------------------------------------------------------
+class C:
+    GRY = "\033[90m"; DIM = "\033[2m"; RED = "\033[31m"; GRN = "\033[32m"
+    BGRN = "\033[92m"; YEL = "\033[33m"; CYN = "\033[36m"; BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
+def _paint(s, color, use):
+    return f"{color}{s}{C.RESET}" if use else s
+
+
+def _short(x, n=32):
+    x = str(x or "")
+    return x if len(x) <= n else x[:n - 1] + "…"
+
+
+def format_event(ev, use_color=True):
+    """Turn one log event into a tidy one-line human summary."""
+    ts = ev.get("ts", "")
+    clock = ts[11:19] if len(ts) >= 19 else "--:--:--"
+    kind = ev.get("kind")
+    action = ev.get("action")
+    g = lambda k, d=0: ev.get(k, d)
+
+    # pick a symbol, short label, color, and detail string per event type
+    if kind == "startup":
+        sym, label, col = "▶", "start", C.BOLD
+        detail = (f"watching {_short(g('target'), 12)} · {g('mode','?')} · "
+                  f"{'LIVE' if g('live') else 'paper'} · bank ${float(g('bankroll',0)):.2f}")
+    elif action in ("BOUGHT", "WOULD_BUY"):
+        sym, label, col = "▲", "BUY", C.GRN
+        detail = (f"{_short(g('title'))}  ${float(g('my_stake',0)):.2f} @ "
+                  f"{float(g('est_fill',0)):.3f}  → bank ${float(g('bankroll',0)):.2f}")
+    elif action in ("SOLD", "WOULD_SELL"):
+        sym, label, col = "▼", "SELL", C.CYN
+        detail = f"{_short(g('title'))}  {float(g('shares',0)):.1f}sh @ {float(g('now_price',0)):.3f}"
+    elif kind == "settled":
+        won = g("result") == "WIN"
+        sym = "✓" if won else "✗"
+        label = "WIN" if won else "LOSS"
+        col = C.BGRN if won else C.RED
+        tail = (f"+${float(g('credit',0)):.2f}" if won else "lost stake")
+        detail = f"resolved {_short(g('token_id'), 10)}  {tail}  → bank ${float(g('bankroll',0)):.2f}"
+    elif action == "skip":
+        sym, label, col = "·", "skip", C.DIM
+        detail = _paint(f"{_short(g('title'))}  — {g('reason','')}", C.DIM, use_color)
+        return f"{_paint(clock, C.GRY, use_color)}  {_paint(f'{sym} {label:<6}', col, use_color)}  {detail}"
+    elif action == "note_only":
+        sym, label, col = "·", "note", C.DIM
+        detail = _paint(f"{_short(g('title'))} — {g('reason','')}", C.DIM, use_color)
+        return f"{_paint(clock, C.GRY, use_color)}  {_paint(f'{sym} {label:<6}', col, use_color)}  {detail}"
+    elif kind == "equity":
+        sym, label, col = "≡", "equity", C.CYN
+        detail = (f"bank ${float(g('bankroll_cash',0)):.2f} · {g('open_positions',0)} open · "
+                  f"{g('mode','?')}")
+    elif kind == "api_error":
+        sym, label, col = "⚠", "ERR", C.YEL
+        detail = f"api: {_short(g('err'), 44)} (retry {g('retry_in','?')}s)"
+    elif action in ("buy_error", "sell_error"):
+        sym, label, col = "⚠", "ERR", C.RED
+        detail = f"{action}: {_short(g('err'), 50)}"
+    elif kind == "shutdown":
+        sym, label, col = "■", "stop", C.DIM
+        detail = "bot stopped"
+    else:
+        sym, label, col = "•", (kind or "?")[:6], C.GRY
+        detail = _short(json.dumps({k: v for k, v in ev.items() if k != "ts"}), 60)
+
+    return (f"{_paint(clock, C.GRY, use_color)}  "
+            f"{_paint(f'{sym} {label:<6}', col, use_color)}  {detail}")
+
+
 def log(event):
     event["ts"] = datetime.now(timezone.utc).isoformat()
-    line = json.dumps(event, default=str)
-    print(line, flush=True)
+    # console: pretty + colored when attached to a terminal, plain otherwise
+    try:
+        print(format_event(event, use_color=sys.stdout.isatty()), flush=True)
+    except Exception:
+        print(json.dumps(event, default=str), flush=True)
+    # file: always compact JSON so analyze.py / status.py stay parseable
     try:
         with open(LOG_PATH, "a") as f:
-            f.write(line + "\n")
+            f.write(json.dumps(event, default=str) + "\n")
     except Exception:
         pass
 
@@ -137,9 +224,9 @@ def fetch_activity(target, limit=50):
 
 
 # ----------------------------------------------------------------------------
-# Strategy inference (kept simple; longshot is the class we act on)
+# Strategy inference
 # ----------------------------------------------------------------------------
-def classify(price, usd, med_size, side):
+def classify(price, side):
     if side == "SELL":
         return "exit"
     if price >= 0.85:  return "grind_near_lock"
@@ -150,7 +237,7 @@ def classify(price, usd, med_size, side):
 
 
 # ----------------------------------------------------------------------------
-# CLOB (read-only always; authed only when LIVE)
+# CLOB
 # ----------------------------------------------------------------------------
 def make_clob():
     from py_clob_client_v2 import ClobClient
@@ -184,11 +271,10 @@ def place(clob, token_id, side, amount, worst_price, tick="0.01"):
 
 
 # ----------------------------------------------------------------------------
-# Sizing — fraction of CURRENT bankroll
+# Sizing
 # ----------------------------------------------------------------------------
 def size_bet(bankroll):
-    raw = bankroll * BET_FRACTION
-    raw = min(raw, MAX_PER_TRADE)
+    raw = min(bankroll * BET_FRACTION, MAX_PER_TRADE)
     return round(raw, 2) if raw >= MIN_ORDER else 0.0
 
 
@@ -197,34 +283,59 @@ def tkey(t):
 
 
 # ----------------------------------------------------------------------------
+# Settlement — credit winning bets that resolved (paper mode only)
+# ----------------------------------------------------------------------------
+def settle_resolved(clob, st):
+    """
+    His winners usually REDEEM at resolution instead of being sold, so we never
+    see a SELL for them. Without this, paper bankroll only ever loses. Here we
+    check each held token's price: if it resolved (~1 win / ~0 loss), close it
+    and credit the payout. Live mode gets real USDC on-chain, so we skip there.
+    """
+    if LIVE:
+        return
+    for token, shares in list(st["holdings"].items()):
+        if shares <= 1e-9:
+            continue
+        p = cur_price(clob, token, "SELL")
+        if p is None:
+            continue
+        if p >= RESOLVE_WIN or p <= RESOLVE_LOSS:
+            credit = round(shares * p, 2)
+            st["bankroll"] += credit
+            st["holdings"][token] = 0
+            log({"kind": "settled", "token_id": token, "shares": round(shares, 3),
+                 "settle_price": p, "credit": credit,
+                 "result": "WIN" if p >= RESOLVE_WIN else "LOSS",
+                 "bankroll": round(st["bankroll"], 2)})
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 def run(target):
     clob = make_clob()
     st = load_state()
-    sizes = deque(maxlen=50)
 
-    # Baseline: on first ever run, mark existing history as seen so we only copy NEW.
     if not st["initialized"]:
-        hist = fetch_activity(target, limit=100)
-        for t in hist:
-            try: sizes.append(float(t.get("usdcSize", 0)))
-            except (TypeError, ValueError): pass
-            st["seen"].add(tkey(t))
+        for t in fetch_activity(target, limit=100):
+            remember(st, tkey(t))       # baseline: don't copy history
         st["initialized"] = True
         save_state(st)
         log({"kind": "startup", "target": target, "live": LIVE,
-             "bankroll": st["bankroll"], "mode": "longshots_only" if LONGSHOTS_ONLY else "all",
+             "bankroll": st["bankroll"],
+             "mode": "longshots_only" if LONGSHOTS_ONLY else "all",
              "note": "baselined history; will copy only new trades"})
 
     last_beat = 0.0
     while True:
-        # equity heartbeat — records the bankroll curve over time for troubleshooting
+        # heartbeat: settle resolved bets, then log the equity snapshot
         if time.time() - last_beat >= HEARTBEAT_SECONDS:
+            settle_resolved(clob, st)
+            save_state(st)
             open_positions = sum(1 for v in st["holdings"].values() if v > 1e-9)
-            invested = round(STARTING_BANKROLL - st["bankroll"], 2)
             log({"kind": "equity", "bankroll_cash": round(st["bankroll"], 2),
-                 "open_positions": open_positions, "cash_invested_in_open": invested,
+                 "open_positions": open_positions,
                  "mode": "live" if LIVE else "paper",
                  "realistic_fills": (not LIVE) and REALISTIC_FILLS})
             last_beat = time.time()
@@ -233,46 +344,42 @@ def run(target):
             k = tkey(t)
             if k in st["seen"]:
                 continue
-            st["seen"].add(k)
+            remember(st, k)
 
             side  = t.get("side", "BUY")
             price = float(t.get("price", 0) or 0)
             usd   = float(t.get("usdcSize", 0) or 0)
             token = t.get("asset")
             title = t.get("title", "")
-            sizes.append(usd)
-            med = sorted(sizes)[len(sizes) // 2] if sizes else 0
-            klass = classify(price, usd, med, side)
+            klass = classify(price, side)
 
             base = {"kind": "target_trade", "title": title, "token_id": token,
                     "condition_id": t.get("conditionId"), "outcome": t.get("outcome"),
                     "side": side, "target_price": price, "target_usd": usd,
                     "intent": {"class": klass}}
 
-            # ---- SELL: exit tokens we hold ----
+            # ---- SELL ----
             if side == "SELL":
                 held = st["holdings"].get(token, 0)
                 if not COPY_SELLS or held <= 0:
                     log({**base, "action": "note_only", "reason": "no position"})
                     continue
                 now = cur_price(clob, token, side)
-                proceeds_price = now or price
+                px = now or price
                 if LIVE:
                     try:
-                        resp = place(clob, token, "SELL", held,
-                                     worst_price=max(0.01, proceeds_price - 0.03))
+                        resp = place(clob, token, "SELL", held, worst_price=max(0.01, px - 0.03))
                         log({**base, "action": "SOLD", "shares": held, "resp": resp})
                     except Exception as e:
                         log({**base, "action": "sell_error", "err": str(e)}); continue
                 else:
-                    log({**base, "action": "WOULD_SELL", "shares": held,
-                         "now_price": proceeds_price})
-                st["bankroll"] += held * proceeds_price
+                    log({**base, "action": "WOULD_SELL", "shares": held, "now_price": px})
+                st["bankroll"] += held * px
                 st["holdings"][token] = 0
                 save_state(st)
                 continue
 
-            # ---- BUY: longshot gate ----
+            # ---- BUY: longshot gates ----
             if LONGSHOTS_ONLY and klass != "longshot_lottery":
                 log({**base, "action": "skip", "reason": f"not a longshot ({klass})"})
                 continue
@@ -287,35 +394,42 @@ def run(target):
                      "bankroll": round(st["bankroll"], 2)})
                 continue
 
+            # per-market exposure cap: don't stack copies into one market
+            cid = t.get("conditionId") or token
+            already = st["per_market"].get(cid, 0.0)
+            if already + stake > st["bankroll"] * MAX_MARKET_FRAC:
+                log({**base, "action": "skip", "reason": "per-market cap reached",
+                     "already_in_market": round(already, 2)})
+                continue
+
             now = cur_price(clob, token, side)
             fill = now or price
-            if fill > price * PAY_MULT:      # edge ran away — cheap fill is the whole edge
+            if fill > price * PAY_MULT:
                 log({**base, "action": "skip", "reason": "price ran past pay-mult",
                      "his_price": price, "now_price": now, "my_stake": stake})
                 continue
 
-            # paper-mode realism: thin cheap markets don't always fill, and fill worse
             if not LIVE and REALISTIC_FILLS and fill <= LOW_LIQ_PRICE:
                 if random.random() < PAPER_FILL_MISS:
                     log({**base, "action": "skip", "reason": "paper: simulated fill miss",
-                         "his_price": price, "est_fill": fill, "my_stake": stake})
+                         "est_fill": fill, "my_stake": stake})
                     continue
-                fill = min(0.99, fill * (1 + PAPER_EXTRA_SLIP))   # pay worse than shown
+                fill = min(0.99, fill * (1 + PAPER_EXTRA_SLIP))
 
             worst = min(0.99, fill * PAY_MULT)
             if LIVE:
                 try:
                     resp = place(clob, token, "BUY", stake, worst_price=worst)
                     st["holdings"][token] += stake / max(fill, 0.01)
+                    st["per_market"][cid] = already + stake
                     st["bankroll"] -= stake
                     log({**base, "action": "BOUGHT", "my_stake": stake, "est_fill": fill,
-                         "worst_price": worst, "resp": resp,
-                         "bankroll": round(st["bankroll"], 2)})
+                         "worst_price": worst, "resp": resp, "bankroll": round(st["bankroll"], 2)})
                 except Exception as e:
-                    log({**base, "action": "buy_error", "err": str(e)})
-                    continue
+                    log({**base, "action": "buy_error", "err": str(e)}); continue
             else:
                 st["holdings"][token] += stake / max(fill, 0.01)
+                st["per_market"][cid] = already + stake
                 st["bankroll"] -= stake
                 log({**base, "action": "WOULD_BUY", "my_stake": stake, "est_fill": fill,
                      "worst_price": worst, "bankroll": round(st["bankroll"], 2)})
@@ -326,12 +440,11 @@ def run(target):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--target", required=True, help="target wallet address (0x...)")
-    ap.add_argument("--reset", action="store_true", help="wipe saved state and re-baseline")
+    ap.add_argument("--target", required=True)
+    ap.add_argument("--reset", action="store_true", help="wipe state and re-baseline")
     args = ap.parse_args()
     if args.reset and os.path.exists(STATE_PATH):
-        os.remove(STATE_PATH)
-        print("state reset.")
+        os.remove(STATE_PATH); print("state reset.")
     try:
         run(args.target)
     except KeyboardInterrupt:
