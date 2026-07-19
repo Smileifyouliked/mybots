@@ -1,0 +1,17 @@
+{
+  "balance": 10000.0,
+  "max_bet": 20.0,
+  "min_ev": 0.10,
+  "max_price": 0.45,
+  "min_volume": 5000,
+  "min_hours": 2.0,
+  "max_hours": 72.0,
+  "kelly_fraction": 0.25,
+  "max_slippage": 0.03,
+  "scan_interval": 3600,
+  "calibration_min": 30,
+  "kernel_sigma": 1.0,
+  "max_book_frac": 0.10,
+  "fee_bps": 0,
+  "vc_key": "3MZ4GTNM4QE295Z9LK873HXEP"
+}
