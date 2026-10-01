@@ -1,3 +1,5 @@
 scout_report.txt
 scout_wallets.csv
 __pycache__/
+backtest_report.txt
+backtest_wallets.csv
